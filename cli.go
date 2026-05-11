@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -18,6 +19,7 @@ import (
 	"github.com/joho/godotenv"
 
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/bias"
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/capital"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/core"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/engine"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/meta"
@@ -57,6 +59,8 @@ func run(args []string) int {
 		return runPaperReplay(args[2:])
 	case "paper-live":
 		return runPaperLive(args[2:])
+	case "capital-sim":
+		return runCapitalSim(args[2:])
 	case "live-signal":
 		return runLiveSignal(args[2:])
 	case "import-cache":
@@ -88,6 +92,7 @@ SUBCOMMANDS
   bootstrap     stationary block bootstrap CIs over a stored run's trades
   paper-replay  replay composite signals over historical candles with FIXED weights and persist results
   paper-live    long-running paper-trader: REST-poll latest candle every interval, signal, grade, persist
+  capital-sim   simulate a fixed-risk + martingale capital scheme over a stored run's trades, per strategy
   live-signal   stream live ticks (TD WSS) and recompose the signal on REST polls
   import-cache  one-shot import of the legacy JSON cache into Postgres
 
@@ -979,6 +984,169 @@ func summarizeLiveRun(ctx context.Context, pool *pgxpool.Pool, paperRunID int64)
 		fmt.Printf("  NetR=%+.2f  (closed trades only)\n", *netR)
 	}
 	fmt.Printf("\n  Inspect: psql -c \"SELECT entry_time, strategy, side, r_realized, win FROM paper_trades WHERE paper_run_id=%d ORDER BY entry_time;\"\n", paperRunID)
+}
+
+func runCapitalSim(args []string) int {
+	fs := flag.NewFlagSet("capital-sim", flag.ContinueOnError)
+	runID := fs.Int64("run-id", 0, "backtest_runs.id whose trades drive the sim (0 = latest)")
+	wfaRunID := fs.Int64("wfa-run", 0, "wfa_runs.id (use composite OOS trades instead of per-strategy backtest trades)")
+	paperRunID := fs.Int64("paper-run", 0, "paper_runs.id (use graded paper trades)")
+	capitalStart := fs.Float64("capital", 280, "initial bankroll in USD")
+	riskFirst := fs.Float64("risk-first", 0.333, "fraction of capital risked on the first trade of the day")
+	riskMart := fs.Float64("risk-martingale", 0.666, "fraction of REMAINING capital risked on the second trade after a loss")
+	maxTrades := fs.Int("max-trades", 2, "max attempts per day (2 = first + one martingale)")
+	reloadThresh := fs.Float64("reload-threshold", 10, "capital below this triggers a reload")
+	reloadAmt := fs.Float64("reload-amount", 200, "USD the capital is set to on reload")
+	minTrades := fs.Int("min-trades", 30, "skip strategies whose total trade count is below this (noise filter)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	// Mutually-exclusive source flags.
+	sourceCount := 0
+	if *runID != 0 {
+		sourceCount++
+	}
+	if *wfaRunID != 0 {
+		sourceCount++
+	}
+	if *paperRunID != 0 {
+		sourceCount++
+	}
+	if sourceCount > 1 {
+		fmt.Fprintln(os.Stderr, "-run-id, -wfa-run and -paper-run are mutually exclusive")
+		return 2
+	}
+
+	ctx := context.Background()
+	pool, err := openPool(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "db: %v\n", err)
+		return 1
+	}
+	defer pool.Close()
+
+	cfg := capital.Config{
+		StartCapital:      *capitalStart,
+		FirstRiskPct:      *riskFirst,
+		MartingaleRiskPct: *riskMart,
+		MaxTradesPerDay:   *maxTrades,
+		ReloadThreshold:   *reloadThresh,
+		ReloadAmount:      *reloadAmt,
+	}
+
+	// Decide the trade source.
+	var (
+		header   string
+		groups   map[string][]core.Trade
+		oneShot  bool
+		oneLabel string
+	)
+	switch {
+	case *wfaRunID != 0:
+		trades, err := loadWFATrades(ctx, pool, *wfaRunID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load wfa trades: %v\n", err)
+			return 1
+		}
+		header = fmt.Sprintf("Capital Sim — wfa_runs.id=%d (composite OOS curve, %d trades)", *wfaRunID, len(trades))
+		oneShot = true
+		oneLabel = fmt.Sprintf("Composite (wfa#%d)", *wfaRunID)
+		groups = map[string][]core.Trade{oneLabel: trades}
+	case *paperRunID != 0:
+		trades, err := loadPaperTrades(ctx, pool, *paperRunID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load paper trades: %v\n", err)
+			return 1
+		}
+		header = fmt.Sprintf("Capital Sim — paper_runs.id=%d (live/replay trades, %d trades)", *paperRunID, len(trades))
+		oneShot = true
+		oneLabel = fmt.Sprintf("Paper (paper#%d)", *paperRunID)
+		groups = map[string][]core.Trade{oneLabel: trades}
+	default:
+		id := *runID
+		if id == 0 {
+			if err := pool.QueryRow(ctx, `SELECT id FROM backtest_runs ORDER BY id DESC LIMIT 1`).Scan(&id); err != nil {
+				fmt.Fprintf(os.Stderr, "find latest run: %v\n", err)
+				return 1
+			}
+		}
+		trades, err := loadBacktestTrades(ctx, pool, id)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load trades: %v\n", err)
+			return 1
+		}
+		header = fmt.Sprintf("Capital Sim — backtest_runs.id=%d (per-strategy, %d trades total)", id, len(trades))
+		groups = map[string][]core.Trade{}
+		for _, t := range trades {
+			groups[t.Strategy] = append(groups[t.Strategy], t)
+		}
+	}
+
+	fmt.Printf("\n═══ %s ═══\n", header)
+	fmt.Printf("  Capital=$%.2f  RiskFirst=%.1f%%  Martingale=%.1f%%  MaxTrades=%d/day  Reload@<$%.0f→$%.0f\n\n",
+		cfg.StartCapital, cfg.FirstRiskPct*100, cfg.MartingaleRiskPct*100,
+		cfg.MaxTradesPerDay, cfg.ReloadThreshold, cfg.ReloadAmount)
+
+	// Run sim per group, collect.
+	results := make([]capital.Result, 0, len(groups))
+	for name, ts := range groups {
+		if !oneShot && len(ts) < *minTrades {
+			continue
+		}
+		results = append(results, capital.Simulate(name, ts, cfg))
+	}
+	// Sort by ROI desc — winner on top.
+	sort.Slice(results, func(i, j int) bool { return results[i].ROIPct > results[j].ROIPct })
+
+	// Print comparison table.
+	fmt.Printf("  %-18s  %-9s  %-9s  %-9s  %-7s  %-7s  %-6s  %-7s\n",
+		"Strategy", "Final$", "Net$", "ROI%", "Days", "Mart", "Bust", "MaxDD%")
+	for _, r := range results {
+		fmt.Printf("  %-18s  %9.2f  %+9.2f  %+7.1f%%  %5d   %5d   %4d   %5.1f%%\n",
+			r.Strategy, r.FinalCapital, r.NetProfit, r.ROIPct,
+			r.DaysWithTrades, r.DaysWithMartingale, r.DaysBusted, r.MaxDrawdownPct*100)
+	}
+
+	if !oneShot {
+		fmt.Println()
+		fmt.Printf("  Legend: Days = days with ≥1 trade, Mart = days where martingale fired,\n")
+		fmt.Printf("  Bust = days that triggered a reload, Net$ = profit MINUS total reloads paid.\n")
+		fmt.Printf("  Skipped strategies with <%d trades (signal too sparse to evaluate).\n", *minTrades)
+	}
+	return 0
+}
+
+// loadPaperTrades pulls closed paper trades for capital-sim. Only the
+// fields the sim consumes (strategy, side, r_realized, win, times) are
+// hydrated — mirrors loadWFATrades.
+func loadPaperTrades(ctx context.Context, pool *pgxpool.Pool, paperRunID int64) ([]core.Trade, error) {
+	rows, err := pool.Query(ctx, `
+		SELECT strategy, side, r_realized, win, entry_time, exit_time
+		FROM paper_trades
+		WHERE paper_run_id = $1
+		ORDER BY entry_time ASC
+	`, paperRunID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []core.Trade
+	for rows.Next() {
+		var t core.Trade
+		var sideStr string
+		if err := rows.Scan(&t.Strategy, &sideStr, &t.R, &t.Win, &t.EntryTime, &t.ExitTime); err != nil {
+			return nil, err
+		}
+		if sideStr == "SHORT" {
+			t.Side = core.Short
+		} else {
+			t.Side = core.Long
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
 }
 
 func runImportCache(args []string) int {
