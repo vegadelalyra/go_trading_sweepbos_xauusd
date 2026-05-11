@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/smc"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy"
 )
 
@@ -20,6 +21,11 @@ type BacktestParams struct {
 	H4Bias    BiasMap // if non-empty, reject signals whose Side disagrees with the H4 EMA200 bias at entry time
 	ATRPeriod int     // candles in ATR window (e.g. 14)
 	ATRMult   float64 // if >0, widen structural SL to max(structural, ATR × ATRMult)
+	// Premium/Discount zone filter. If > 0, longs are accepted only when
+	// the entry sits in the lower half of the most-recent N-bar dealing
+	// range, shorts only in the upper half — the smart-money "buy
+	// discount, sell premium" heuristic. 96 = 24h on 15m.
+	PDLookback int
 }
 
 func DefaultParams() BacktestParams {
@@ -240,6 +246,19 @@ func RunBacktest(candles []Candle, strategies []strategy.Strategy, p BacktestPar
 							sig.TP = sig.Entry - atrD*strategy.DefaultRR
 						}
 					}
+				}
+			}
+			// Premium/Discount filter: only long in the lower half of the
+			// dealing range, only short in the upper half. Fades the
+			// retail-trap signals that would have entered on the wrong
+			// side of institutional value.
+			if p.PDLookback > 0 {
+				dr := smc.CurrentDealingRange(candles, i, p.PDLookback)
+				if sig.Side == Long && dr.InPremium(sig.Entry) {
+					continue
+				}
+				if sig.Side == Short && dr.InDiscount(sig.Entry) {
+					continue
 				}
 			}
 			// Engine-level guard: reject signals whose SL distance is unreasonable.

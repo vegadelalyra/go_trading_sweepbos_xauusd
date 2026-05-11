@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/smc"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy"
 )
 
@@ -31,6 +32,7 @@ type WFAConfig struct {
 	UseBias         bool
 	ATRMult         float64
 	H4Period        int
+	PDLookback      int // Premium/Discount filter lookback in candles (0 disables)
 }
 
 // WFAWindow holds one IS→OOS slice plus the OOS-side performance.
@@ -103,6 +105,7 @@ func RunWFA(ctx context.Context, pool *pgxpool.Pool, cfg WFAConfig) (WFAResult, 
 			params.ATRMult = cfg.ATRMult
 			params.ATRPeriod = 14
 		}
+		params.PDLookback = cfg.PDLookback
 
 		isResult := RunBacktest(isCandles, strategy.All(), params)
 		weightsList := computeWeights(isResult.Trades)
@@ -293,6 +296,17 @@ func simulateOOS(candles []Candle, p BacktestParams, weights map[string]float64,
 				continue
 			}
 			if bias < 0 && cs.Side == Long {
+				continue
+			}
+		}
+
+		// Premium/Discount filter on the composite entry.
+		if p.PDLookback > 0 {
+			dr := smc.CurrentDealingRange(candles, i, p.PDLookback)
+			if cs.Side == Long && dr.InPremium(cs.BestEntry) {
+				continue
+			}
+			if cs.Side == Short && dr.InDiscount(cs.BestEntry) {
 				continue
 			}
 		}

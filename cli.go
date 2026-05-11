@@ -205,6 +205,7 @@ func runBacktestCLI(args []string) int {
 	h4Period := fs.Int("h4-period", 200, "EMA period for the H4 bias filter")
 	atrMult := fs.Float64("atr-mult", 0, "if >0, widen SL to max(structural, ATR×mult)")
 	atrPeriod := fs.Int("atr-period", 14, "ATR period when -atr-mult is set")
+	pdLookback := fs.Int("pd-lookback", 0, "Premium/Discount filter lookback in candles (0 disables, 96 = 24h on 15m)")
 	useXAG := fs.Bool("xag", false, "load XAG/USD candles for the XAUXAGPairs strategy")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -269,6 +270,10 @@ func runBacktestCLI(args []string) int {
 		params.ATRMult = *atrMult
 		params.ATRPeriod = *atrPeriod
 		fmt.Printf("ATR SL widening ON  (mult=%.2f period=%d)\n", *atrMult, *atrPeriod)
+	}
+	if *pdLookback > 0 {
+		params.PDLookback = *pdLookback
+		fmt.Printf("Premium/Discount filter ON  (lookback=%d candles)\n", *pdLookback)
 	}
 	if *useXAG {
 		xag, err := loadCandles(ctx, pool, "XAG/USD", "1h", from, to)
@@ -435,6 +440,7 @@ func runWFA(args []string) int {
 	useBias := fs.Bool("bias", true, "apply H4 EMA bias filter inside each window")
 	atrMult := fs.Float64("atr-mult", 1.5, "ATR SL widening multiplier (0 disables)")
 	h4Period := fs.Int("h4-period", 200, "EMA period for the H4 bias")
+	pdLookback := fs.Int("pd-lookback", 0, "Premium/Discount filter lookback in candles (0 disables)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -451,6 +457,7 @@ func runWFA(args []string) int {
 		Symbol: *symbol, Interval: *interval,
 		ISWindowMonths: *is, OOSWindowMonths: *oos, StepMonths: *step,
 		Threshold: *threshold, UseBias: *useBias, ATRMult: *atrMult, H4Period: *h4Period,
+		PDLookback: *pdLookback,
 	}
 	res, err := RunWFA(ctx, pool, cfg)
 	if err != nil {
