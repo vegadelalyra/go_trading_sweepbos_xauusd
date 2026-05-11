@@ -332,6 +332,37 @@ func runBacktestCLI(args []string) int {
 	return 0
 }
 
+// parseTiers parses a comma-separated list of "threshold:risk" pairs into
+// a sorted []capital.Tier for the capital-sim. Pairs are ASC by threshold.
+// Martingale per tier is implicitly 0 (no martingale) since the user
+// configures with -risk-martingale globally; mixing tier-mart and global
+// mart would be ambiguous.
+func parseTiers(s string) ([]capital.Tier, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]capital.Tier, 0, len(parts))
+	for _, p := range parts {
+		fields := strings.Split(strings.TrimSpace(p), ":")
+		if len(fields) != 2 {
+			return nil, fmt.Errorf("invalid tier %q: want \"threshold:risk\"", p)
+		}
+		th, err := strconv.ParseFloat(strings.TrimSpace(fields[0]), 64)
+		if err != nil || th < 0 {
+			return nil, fmt.Errorf("invalid tier threshold %q: non-negative number required", fields[0])
+		}
+		r, err := strconv.ParseFloat(strings.TrimSpace(fields[1]), 64)
+		if err != nil || r <= 0 || r > 1 {
+			return nil, fmt.Errorf("invalid tier risk %q: 0 < r ≤ 1 required", fields[1])
+		}
+		out = append(out, capital.Tier{Threshold: th, FirstRiskPct: r})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Threshold < out[j].Threshold })
+	return out, nil
+}
+
 // parsePaperRunIDs splits a comma-separated string like "3,7,12" into a
 // []int64 of paper_run IDs. Empty input returns (nil, nil). Used by every
 // subcommand that consumes weights so the paper→weights feedback loop is
@@ -1001,7 +1032,13 @@ func runCapitalSim(args []string) int {
 	reloadAmt := fs.Float64("reload-amount", 200, "USD the capital is set to on reload")
 	minTrades := fs.Int("min-trades", 30, "skip strategies whose total trade count is below this (noise filter)")
 	strategyFilter := fs.String("strategy", "", "if set, simulate ONLY trades from this strategy (works with any source flag)")
+	tiersFlag := fs.String("tiers", "", "capital-band tiers \"threshold:risk[,threshold:risk]...\" — e.g. \"100000:0.1925,1000000:0.0963\" steps down to Half/Quarter Kelly at $100k/$1M")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	tiers, err := parseTiers(*tiersFlag)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
 
@@ -1036,6 +1073,7 @@ func runCapitalSim(args []string) int {
 		MaxTradesPerDay:   *maxTrades,
 		ReloadThreshold:   *reloadThresh,
 		ReloadAmount:      *reloadAmt,
+		Tiers:             tiers,
 	}
 
 	// Decide the trade source.

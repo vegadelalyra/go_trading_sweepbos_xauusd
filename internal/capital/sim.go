@@ -17,6 +17,23 @@ import (
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/core"
 )
 
+// Tier defines a capital band with its own risk parameters. The simulator
+// picks the first tier whose Threshold ≤ current capital at the start of
+// each day, falling back to the Config's base FirstRiskPct/MartingaleRiskPct
+// if no tier matches. Tiers MUST be sorted by Threshold ASC; the caller
+// owns ordering.
+//
+// Why tiers exist: a trader who accepts full-Kelly risk at $280 of seed
+// capital does NOT want full-Kelly at $100k — at high bankroll the goal
+// shifts from max-growth to capital preservation. Stair-stepping the risk
+// down at capital milestones is the canonical fractional-Kelly approach.
+type Tier struct {
+	Threshold         float64 // current capital ≥ this triggers this tier
+	FirstRiskPct      float64
+	MartingaleRiskPct float64 // 0 disables martingale at this tier
+	MaxTradesPerDay   int     // 0 inherits config's base
+}
+
 // Config defines the money-management rule being simulated.
 type Config struct {
 	// StartCapital — initial bankroll (USD).
@@ -46,6 +63,28 @@ type Config struct {
 	// ReloadAmount — capital set TO (not added to) on reload. The
 	// trader treats the reload as a fresh injection.
 	ReloadAmount float64
+	// Tiers — optional capital-band overrides for the risk parameters.
+	// When non-empty, the simulator picks the highest-threshold tier
+	// whose Threshold ≤ current capital at day-start, and uses that
+	// tier's FirstRiskPct / MartingaleRiskPct in place of the base.
+	// MaxTradesPerDay=0 in a tier inherits the base setting.
+	Tiers []Tier
+}
+
+// pickTier returns the active tier for `capital` (highest Threshold ≤
+// capital), or zero-value if none match. Tiers must be Threshold-ASC.
+func (c Config) pickTier(capital float64) (Tier, bool) {
+	var picked Tier
+	found := false
+	for _, t := range c.Tiers {
+		if capital >= t.Threshold {
+			picked = t
+			found = true
+		} else {
+			break
+		}
+	}
+	return picked, found
 }
 
 // DefaultConfig is the user's stated scheme: $280 start, 33.3% first,
@@ -167,11 +206,26 @@ func Simulate(strategyName string, trades []core.Trade, cfg Config) Result {
 			prevDayStart = capital
 		}
 
+		// Resolve the active risk parameters for this day. Tier override
+		// (if any) wins over the base config; tiers were already chosen
+		// when prevDayStart was captured, but we re-pick here against
+		// the captured daystart so risk is consistent within the day.
+		firstRisk := cfg.FirstRiskPct
+		martRisk := cfg.MartingaleRiskPct
+		maxTrades := cfg.MaxTradesPerDay
+		if tier, ok := cfg.pickTier(prevDayStart); ok {
+			firstRisk = tier.FirstRiskPct
+			martRisk = tier.MartingaleRiskPct
+			if tier.MaxTradesPerDay > 0 {
+				maxTrades = tier.MaxTradesPerDay
+			}
+		}
+
 		switch dayUsed {
 		case 0:
 			// First (and possibly only) trade of the day. Risk is
 			// computed against THIS day's starting capital.
-			risk := cfg.FirstRiskPct * prevDayStart
+			risk := firstRisk * prevDayStart
 			capital += t.R * risk
 			dayUsed = 1
 			freeAt = t.ExitTime
@@ -184,10 +238,10 @@ func Simulate(strategyName string, trades []core.Trade, cfg Config) Result {
 			// capital, not against the post-loss capital. So if
 			// FirstRiskPct=33.3% and MartingaleRiskPct=66.6%, two SLs in
 			// a row really do consume 99.9% of the day's bankroll.
-			if !martingaleOK || cfg.MaxTradesPerDay < 2 {
+			if !martingaleOK || maxTrades < 2 || martRisk <= 0 {
 				continue
 			}
-			risk := cfg.MartingaleRiskPct * prevDayStart
+			risk := martRisk * prevDayStart
 			capital += t.R * risk
 			dayUsed = 2
 			freeAt = t.ExitTime
