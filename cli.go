@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -546,13 +547,25 @@ func runBootstrap(args []string) int {
 	runID := fs.Int64("run-id", 0, "backtest_runs.id to bootstrap (0 = latest plain run, mutually exclusive with -wfa-run)")
 	wfaRunID := fs.Int64("wfa-run", 0, "wfa_runs.id to bootstrap (operates on the concatenated OOS curve)")
 	iterations := fs.Int("iterations", 5000, "bootstrap iterations (≥5000 recommended for stable tails)")
-	blockLen := fs.Float64("block", 40, "expected block length in trades (geometric distribution)")
+	blockLen := fs.Float64("block", 40, "expected block length in trades (geometric distribution); ignored when -block-grid is set")
+	blockGrid := fs.String("block-grid", "", "comma-separated block lengths (e.g. \"10,20,40,60\") — prints CI sensitivity to the geometric block parameter")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if *runID != 0 && *wfaRunID != 0 {
 		fmt.Fprintln(os.Stderr, "-run-id and -wfa-run are mutually exclusive")
 		return 2
+	}
+	var grid []float64
+	if *blockGrid != "" {
+		for _, s := range strings.Split(*blockGrid, ",") {
+			v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+			if err != nil || v <= 0 {
+				fmt.Fprintf(os.Stderr, "invalid -block-grid entry %q: positive number required\n", s)
+				return 2
+			}
+			grid = append(grid, v)
+		}
 	}
 
 	ctx := context.Background()
@@ -594,7 +607,27 @@ func runBootstrap(args []string) int {
 		return 1
 	}
 
-	br := StationaryBlockBootstrap(trades, *iterations, *blockLen, engine.DefaultParams().StartBalance, engine.DefaultParams().RiskPct)
+	startBal := engine.DefaultParams().StartBalance
+	riskPct := engine.DefaultParams().RiskPct
+	if len(grid) > 0 {
+		fmt.Printf("\n═══ %s — block-grid sweep (%d iterations each, N=%d) ═══\n",
+			header, *iterations, len(trades))
+		fmt.Printf("  %-6s  %-22s  %-22s  %-22s  %-22s\n",
+			"block", "Sharpe (mean, 95% CI)", "MaxDD (mean, 95% CI)", "Calmar (mean, 95% CI)", "NetR (mean, 95% CI)")
+		for _, b := range grid {
+			br := StationaryBlockBootstrap(trades, *iterations, b, startBal, riskPct)
+			fmt.Printf("  %-6.0f  %+5.2f [%+5.2f,%+5.2f]   %4.1f%% [%4.1f%%,%4.1f%%]    %+5.2f [%+5.2f,%+5.2f]   %+6.2f [%+6.2f,%+6.2f]\n",
+				b,
+				br.SharpeMean, br.SharpeLow95, br.SharpeHigh95,
+				br.MaxDDMean*100, br.MaxDDLow95*100, br.MaxDDHigh95*100,
+				br.CalmarMean, br.CalmarLow95, br.CalmarHigh95,
+				br.NetRMean, br.NetRLow95, br.NetRHigh95,
+			)
+		}
+		return 0
+	}
+
+	br := StationaryBlockBootstrap(trades, *iterations, *blockLen, startBal, riskPct)
 	fmt.Printf("\n═══ %s ═══\n", header)
 	fmt.Print(formatBootstrap(br, len(trades)))
 	return 0
