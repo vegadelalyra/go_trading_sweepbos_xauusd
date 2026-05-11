@@ -44,18 +44,24 @@ func DefaultParams() BacktestParams {
 
 // ParamsFor15m / ParamsFor1h / ParamsFor4h tune the per-timeframe caps so the
 // same DefaultParams template still works at every interval the engine accepts.
+//
+// MaxHoldCandles tightens dramatically from the original 24h / 2d / 5d:
+// SMC intraday setups should mature within a single session. Trades that
+// linger past 6-8 hours are almost always net-negative drift, and the time
+// stop pays a small mark-to-close loss instead of letting the position
+// inflate the time-in-market without a reason.
 func ParamsFor(interval string) BacktestParams {
 	p := DefaultParams()
 	switch interval {
 	case "15m":
 		p.MaxSLPoints = 50
-		p.MaxHoldCandles = 96 // 24h
+		p.MaxHoldCandles = 24 // 6h
 	case "1h":
 		p.MaxSLPoints = 100
-		p.MaxHoldCandles = 48 // 2 days
+		p.MaxHoldCandles = 12 // 12h
 	case "4h":
 		p.MaxSLPoints = 200
-		p.MaxHoldCandles = 30 // 5 days
+		p.MaxHoldCandles = 6 // 24h
 	}
 	return p
 }
