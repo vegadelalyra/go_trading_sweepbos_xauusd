@@ -17,6 +17,7 @@ import (
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/livefeed"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/meta"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/smc"
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy"
 )
 
 // LiveConfig parametrises a paper-live run. PollSeconds=0 means "align to
@@ -305,8 +306,9 @@ func acceptSignal(candles []core.Candle, i int, cs meta.CompositeSignal, p engin
 			return pendingPosition{}, false
 		}
 	}
-	// PD filter on the composite entry.
-	if p.PDLookback > 0 {
+	// PD filter on the composite entry — exempt breakout strategies
+	// (whose entries are AT range extremes by design, see strategy.IsBreakout).
+	if p.PDLookback > 0 && !strategy.IsBreakout(cs.WinnerStrategy) {
 		dr := smc.CurrentDealingRange(candles, i, p.PDLookback)
 		if cs.Side == core.Long && dr.InPremium(cs.BestEntry) {
 			return pendingPosition{}, false

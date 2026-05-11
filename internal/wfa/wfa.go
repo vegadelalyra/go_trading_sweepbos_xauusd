@@ -347,8 +347,12 @@ func SimulateOOS(candles []core.Candle, p engine.BacktestParams, compose Compose
 			}
 		}
 
-		// Premium/Discount filter on the composite entry.
-		if p.PDLookback > 0 {
+		// Premium/Discount filter on the composite entry — exempt
+		// breakout strategies (their entries are AT the range extreme
+		// by design; the filter would always reject them). The check
+		// uses cs.WinnerStrategy because that's whose levels the
+		// composite chose to take.
+		if p.PDLookback > 0 && !strategy.IsBreakout(cs.WinnerStrategy) {
 			dr := smc.CurrentDealingRange(candles, i, p.PDLookback)
 			if cs.Side == core.Long && dr.InPremium(cs.BestEntry) {
 				continue

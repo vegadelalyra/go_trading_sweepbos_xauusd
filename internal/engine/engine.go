@@ -312,7 +312,11 @@ func RunBacktest(candles []core.Candle, strategies []strategy.Strategy, p Backte
 			// dealing range, only short in the upper half. Fades the
 			// retail-trap signals that would have entered on the wrong
 			// side of institutional value.
-			if p.PDLookback > 0 {
+			//
+			// Breakout strategies are EXEMPT — they fire at the range
+			// extreme by construction, so the PD filter would silence
+			// them entirely. See strategy.IsBreakout for the list.
+			if p.PDLookback > 0 && !strategy.IsBreakout(sig.Strategy) {
 				dr := smc.CurrentDealingRange(candles, i, p.PDLookback)
 				if sig.Side == core.Long && dr.InPremium(sig.Entry) {
 					continue

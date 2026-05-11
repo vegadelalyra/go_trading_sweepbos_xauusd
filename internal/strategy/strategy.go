@@ -43,3 +43,23 @@ type Strategy interface {
 	Meta() Meta
 	Detect(candles []core.Candle, a smc.Analysis, i int) (core.Signal, bool)
 }
+
+// IsBreakout reports whether a strategy is a breakout/momentum setup by
+// name. Breakout strategies fire when price breaks ABOVE recent range
+// highs (long) or BELOW recent range lows (short) — their entries land
+// in the upper/lower extreme of the dealing range BY CONSTRUCTION, not
+// by accident. Applying the SMC Premium/Discount filter to them is a
+// category error: the filter encodes the mean-reversion thesis ("buy
+// value, sell extreme"), the opposite of what a breakout sets up to do.
+//
+// Engine.RunBacktest, wfa.SimulateOOS and paper.acceptSignal all consult
+// this to skip the PD gate for breakout signals. Mean-reversion-flavored
+// strategies (FVGFill, OrderBlockMit, SilverBullet, OTE…) still get the
+// PD filter applied — that's where the filter pays its keep.
+func IsBreakout(name string) bool {
+	switch name {
+	case "DailyBreakout", "AsianRangeBO":
+		return true
+	}
+	return false
+}
