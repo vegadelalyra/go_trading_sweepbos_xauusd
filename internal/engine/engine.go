@@ -54,7 +54,7 @@ func DefaultParams() BacktestParams {
 		SpreadDollar:    0.50,
 		MinIndex:        50,
 		MaxSLPoints:     50,
-		MaxHoldCandles:  96,
+		MaxHoldCandles:  0, // no time-stop; mark-to-market at end-of-data instead
 		CooldownCandles: 4,
 	}
 }
@@ -62,23 +62,26 @@ func DefaultParams() BacktestParams {
 // ParamsFor15m / ParamsFor1h / ParamsFor4h tune the per-timeframe caps so the
 // same DefaultParams template still works at every interval the engine accepts.
 //
-// MaxHoldCandles tightens dramatically from the original 24h / 2d / 5d:
-// SMC intraday setups should mature within a single session. Trades that
-// linger past 6-8 hours are almost always net-negative drift, and the time
-// stop pays a small mark-to-close loss instead of letting the position
-// inflate the time-in-market without a reason.
+// MaxHoldCandles is 0 by default: trades run until SL or TP touches,
+// with a final mark-to-market close-out on the last available bar so
+// open positions don't silently disappear when the backtest window
+// ends. The earlier 6h/12h/24h caps were a defensive heuristic ("SMC
+// setups should mature within a session"); removing them lets winners
+// reach full +RR and losers reach full -1R. Net effect on edge is an
+// open empirical question — see project memory for the latest sweep.
+// Callers that want a time-stop can override MaxHoldCandles per run.
 func ParamsFor(interval string) BacktestParams {
 	p := DefaultParams()
 	switch interval {
 	case "15m":
 		p.MaxSLPoints = 50
-		p.MaxHoldCandles = 24 // 6h
+		p.MaxHoldCandles = 0
 	case "1h":
 		p.MaxSLPoints = 100
-		p.MaxHoldCandles = 12 // 12h
+		p.MaxHoldCandles = 0
 	case "4h":
 		p.MaxSLPoints = 200
-		p.MaxHoldCandles = 6 // 24h
+		p.MaxHoldCandles = 0
 	}
 	return p
 }
@@ -334,6 +337,47 @@ func RunBacktest(candles []core.Candle, strategies []strategy.Strategy, p Backte
 			}
 			open = &t
 			break
+		}
+	}
+
+	// End-of-data mark-to-market. Without MaxHoldCandles enforcing a
+	// time-stop, a position still open at the last bar would silently
+	// drop from the trade record. Close it at the last candle's close
+	// using the same R formula the time-stop branch used, so stats and
+	// equity curve include every trade that opened during the run.
+	if open != nil && len(candles) > 0 {
+		last := candles[len(candles)-1]
+		open.ExitPrice = last.Close
+		if open.Side == core.Long {
+			rd := open.Entry - open.SL
+			if rd > 0 {
+				open.R = (last.Close - open.Entry) / rd
+			}
+		} else {
+			rd := open.SL - open.Entry
+			if rd > 0 {
+				open.R = (open.Entry - last.Close) / rd
+			}
+		}
+		open.Win = open.R > 0
+		open.ExitIdx = len(candles) - 1
+		open.ExitTime = last.Time
+		risk := balance * p.RiskPct
+		balance += risk * open.R
+		open.BalanceAfter = balance
+		open.Session = core.ClassifySession(open.EntryTime)
+		open.YearMonth = core.YearMonthBucket(open.EntryTime)
+		open.YearQuarter = core.YearQuarterBucket(open.EntryTime)
+		open.CandlesToExit = open.ExitIdx - open.EntryIdx
+		trades = append(trades, *open)
+		if balance > peak {
+			peak = balance
+		}
+		if peak > 0 {
+			dd := (peak - balance) / peak
+			if dd > maxDDPct {
+				maxDDPct = dd
+			}
 		}
 	}
 

@@ -402,6 +402,38 @@ func SimulateOOS(candles []core.Candle, p engine.BacktestParams, compose Compose
 			TP:        tp,
 		}
 	}
+
+	// End-of-window mark-to-market — same contract as engine.RunBacktest.
+	// Without MaxHoldCandles, a trade opened late in the OOS window can
+	// reach the end of the slice still open. Force-close at the last
+	// bar's close so its R contributes to the window's stats instead of
+	// vanishing.
+	if open != nil && len(candles) > 0 {
+		last := candles[len(candles)-1]
+		open.ExitPrice = last.Close
+		if open.Side == core.Long {
+			rd := open.Entry - open.SL
+			if rd > 0 {
+				open.R = (last.Close - open.Entry) / rd
+			}
+		} else {
+			rd := open.SL - open.Entry
+			if rd > 0 {
+				open.R = (open.Entry - last.Close) / rd
+			}
+		}
+		open.Win = open.R > 0
+		open.ExitIdx = len(candles) - 1
+		open.ExitTime = last.Time
+		risk := balance * p.RiskPct
+		balance += risk * open.R
+		open.BalanceAfter = balance
+		open.Session = core.ClassifySession(open.EntryTime)
+		open.YearMonth = core.YearMonthBucket(open.EntryTime)
+		open.YearQuarter = core.YearQuarterBucket(open.EntryTime)
+		open.CandlesToExit = open.ExitIdx - open.EntryIdx
+		trades = append(trades, *open)
+	}
 	return trades
 }
 
