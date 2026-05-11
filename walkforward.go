@@ -315,8 +315,9 @@ func simulateOOS(candles []Candle, p BacktestParams, weights map[string]float64,
 		if p.ATRMult > 0 && p.ATRPeriod > 0 {
 			atr := ATRAt(candles, i, p.ATRPeriod)
 			if atr > 0 {
+				mult := p.ATRMult * sessionATRScale(c.Time)
 				structuralD := math.Abs(entry - sl)
-				atrD := atr * p.ATRMult
+				atrD := atr * mult
 				if atrD > structuralD {
 					if cs.Side == Long {
 						sl = entry - atrD

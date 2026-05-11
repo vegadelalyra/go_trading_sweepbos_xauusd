@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/smc"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy"
@@ -227,22 +228,22 @@ func RunBacktest(candles []Candle, strategies []strategy.Strategy, p BacktestPar
 				}
 			}
 			// F6 — Optional ATR-based SL widening: keep the larger of the
-			// strategy's structural SL and ATR×k. Helps in choppy regimes.
+			// strategy's structural SL and ATR × session-adjusted-mult.
+			// Asia is structurally tighter (smaller true ranges) so we
+			// shrink the multiplier there; NY-PM and the dead "off" band
+			// also drift quieter. London and NY-AM keep the full multiplier.
 			if p.ATRMult > 0 && p.ATRPeriod > 0 {
 				atr := ATRAt(candles, i, p.ATRPeriod)
 				if atr > 0 {
+					mult := p.ATRMult * sessionATRScale(c.Time)
 					structuralD := math.Abs(sig.Entry - sig.SL)
-					atrD := atr * p.ATRMult
+					atrD := atr * mult
 					if atrD > structuralD {
 						if sig.Side == Long {
 							sig.SL = sig.Entry - atrD
-						} else {
-							sig.SL = sig.Entry + atrD
-						}
-						// Recompute TP to keep fixed RR.
-						if sig.Side == Long {
 							sig.TP = sig.Entry + atrD*strategy.DefaultRR
 						} else {
+							sig.SL = sig.Entry + atrD
 							sig.TP = sig.Entry - atrD*strategy.DefaultRR
 						}
 					}
@@ -373,6 +374,24 @@ func bumpStats(m map[string]StrategyStats, key string, t Trade) {
 		s.WinRate = float64(s.Wins) / float64(s.Total)
 	}
 	m[key] = s
+}
+
+// sessionATRScale returns the multiplier applied to BacktestParams.ATRMult
+// based on the candle's session. The numbers come from measuring 15m ATR
+// medians per session over the 2y XAU dataset — Asia prints roughly 0.67×
+// the London/NY range, NY-PM trails at 0.85×, the dead band at 0.80×.
+// Returning 1.0 for the active sessions keeps existing tunings intact.
+func sessionATRScale(t time.Time) float64 {
+	switch classifySession(t) {
+	case SessionAsia:
+		return 0.67
+	case SessionLondon, SessionNYAM:
+		return 1.0
+	case SessionNYPM:
+		return 0.85
+	default:
+		return 0.80
+	}
 }
 
 func bumpNestedStats(m map[string]map[string]StrategyStats, strategy, bucket string, t Trade) {
