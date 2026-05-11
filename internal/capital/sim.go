@@ -72,14 +72,29 @@ type Result struct {
 	Peak               float64
 }
 
-// Simulate runs the capital scheme over `trades` (expected pre-sorted by
-// entry_time, but we sort defensively) and returns the post-simulation
-// summary. Trades are bucketed by calendar day in their entry-time's
-// local zone; the user picks at most MaxTradesPerDay per day, taking
-// trades in time-order.
-func Simulate(strategy string, trades []core.Trade, cfg Config) Result {
+// Simulate runs the capital scheme over `trades` and returns the
+// post-simulation summary. Two realism constraints model how a manual
+// retail trader actually operates:
+//
+//  1. Mutex — only one position can be open at a time. If a previous
+//     trade's exit_time spans into the next day, that next day is
+//     blocked for new entries until the position closes. This matters
+//     because the backtest engine permits trades up to MaxHoldCandles
+//     long (6h on 15m) which routinely cross midnight UTC.
+//
+//  2. Daily cap — the trader picks at most one fresh entry per day
+//     (cfg.MaxTradesPerDay==1) or one fresh entry plus one martingale
+//     if the first attempt lost (cfg.MaxTradesPerDay==2). No multiple
+//     independent trades on the same day even if the strategy fires
+//     a dozen setups: a human can only watch one position at a time.
+//
+// The mutex AND the daily cap are evaluated against trades in their
+// recorded entry_time order — we walk the stream once and keep two
+// pieces of state (freeAt = when the next position can open;
+// dayUsed = attempts spent today).
+func Simulate(strategyName string, trades []core.Trade, cfg Config) Result {
 	res := Result{
-		Strategy:          strategy,
+		Strategy:          strategyName,
 		StartCapital:      cfg.StartCapital,
 		TotalContribution: cfg.StartCapital,
 	}
@@ -92,64 +107,85 @@ func Simulate(strategy string, trades []core.Trade, cfg Config) Result {
 	sorted := append([]core.Trade(nil), trades...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].EntryTime.Before(sorted[j].EntryTime) })
 
-	// Group by UTC calendar day. We use UTC because backtest_trades
-	// stores entry_time in UTC; the trader's local day boundary is a
-	// rough approximation but stable across the dataset.
-	byDay := make(map[time.Time][]core.Trade)
-	for _, t := range sorted {
-		d := time.Date(t.EntryTime.Year(), t.EntryTime.Month(), t.EntryTime.Day(), 0, 0, 0, 0, time.UTC)
-		byDay[d] = append(byDay[d], t)
+	dayOf := func(t time.Time) time.Time {
+		return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
 	}
-	days := make([]time.Time, 0, len(byDay))
-	for d := range byDay {
-		days = append(days, d)
-	}
-	sort.Slice(days, func(i, j int) bool { return days[i].Before(days[j]) })
 
 	capital := cfg.StartCapital
 	res.Peak = capital
-	for _, d := range days {
-		dayTrades := byDay[d]
-		dayStart := capital
-		tookSecond := false
 
-		// First attempt of the day.
-		if len(dayTrades) >= 1 && capital > 0 {
-			risk := cfg.FirstRiskPct * capital
-			capital += dayTrades[0].R * risk
-			// Martingale only fires when the first attempt lost AND
-			// we still have inventory of trades for the day AND we
-			// still have positive capital to risk.
-			if !dayTrades[0].Win && cfg.MaxTradesPerDay >= 2 && len(dayTrades) >= 2 && capital > 0 {
-				risk2 := cfg.MartingaleRiskPct * capital
-				capital += dayTrades[1].R * risk2
-				tookSecond = true
-			}
-			res.DaysWithTrades++
-			if tookSecond {
-				res.DaysWithMartingale++
-			}
+	var (
+		currentDay   time.Time
+		dayUsed      int  // 0=untouched, 1=first taken, 2=martingale taken
+		martingaleOK bool // first trade today lost → eligible for martingale
+		freeAt       time.Time
+		prevDayStart float64
+	)
+
+	// tallyDay closes out the books for currentDay: counts win/loss day
+	// and triggers a reload if the day-end capital fell below threshold.
+	// Called both at every day rollover and once after the final trade.
+	tallyDay := func() {
+		if currentDay.IsZero() {
+			return
 		}
-
-		// Reload after the day's P&L crystallises. Threshold check
-		// avoids reloading when capital is just dented (the trader
-		// only refills on a real bust).
+		if capital > prevDayStart {
+			res.WinDays++
+		} else if capital < prevDayStart {
+			res.LossDays++
+		}
 		if capital < cfg.ReloadThreshold {
 			capital = cfg.ReloadAmount
 			res.Reloads++
 			res.DaysBusted++
 			res.TotalContribution += cfg.ReloadAmount
 		}
+	}
 
-		if capital > dayStart {
-			res.WinDays++
-		} else if capital < dayStart {
-			res.LossDays++
+	for _, t := range sorted {
+		// Mutex: skip trades whose entry overlaps the previous trade's
+		// open window. Backtest data may include strategy-overlap
+		// candidates that the live trader can't take simultaneously.
+		if !freeAt.IsZero() && t.EntryTime.Before(freeAt) {
+			continue
 		}
 
-		// Drawdown tracked on the equity curve (capital + cumulative
-		// reload contribution — measures the trader's true exposure
-		// across the run).
+		d := dayOf(t.EntryTime)
+		if !currentDay.Equal(d) {
+			tallyDay()
+			currentDay = d
+			dayUsed = 0
+			martingaleOK = false
+			prevDayStart = capital
+		}
+
+		switch dayUsed {
+		case 0:
+			// First (and possibly only) trade of the day.
+			risk := cfg.FirstRiskPct * capital
+			capital += t.R * risk
+			dayUsed = 1
+			freeAt = t.ExitTime
+			martingaleOK = !t.Win
+			res.DaysWithTrades++
+
+		case 1:
+			// Martingale slot — only if the first lost AND user opted in.
+			if !martingaleOK || cfg.MaxTradesPerDay < 2 {
+				continue
+			}
+			risk := cfg.MartingaleRiskPct * capital
+			capital += t.R * risk
+			dayUsed = 2
+			freeAt = t.ExitTime
+			martingaleOK = false
+			res.DaysWithMartingale++
+
+		default:
+			// Day's quota used; skip every remaining trade on this day.
+			continue
+		}
+
 		if capital > res.Peak {
 			res.Peak = capital
 		}
@@ -160,6 +196,9 @@ func Simulate(strategy string, trades []core.Trade, cfg Config) Result {
 			}
 		}
 	}
+
+	// Flush the final day's win/loss/reload tally.
+	tallyDay()
 
 	res.FinalCapital = capital
 	res.NetProfit = capital - res.TotalContribution
