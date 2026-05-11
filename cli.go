@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"strings"
@@ -34,6 +35,8 @@ func run(args []string) int {
 		return runSignal(args[2:])
 	case "weights":
 		return runWeights(args[2:])
+	case "wfa":
+		return runWFA(args[2:])
 	case "import-cache":
 		return runImportCache(args[2:])
 	case "-h", "--help", "help":
@@ -59,6 +62,7 @@ SUBCOMMANDS
   backtest      run the backtest against cached candles and print bucket stats
   signal        compose a live signal using strategy weights from a past run
   weights       print the per-strategy weights derived from a past run
+  wfa           walk-forward analysis: rolling IS→OOS windows
   import-cache  one-shot import of the legacy JSON cache into Postgres
 
 FLAGS for `+"`backfill`"+`
@@ -396,6 +400,70 @@ func runSignal(args []string) int {
 			fmt.Println("  No recommended signals in scan window.")
 		}
 	}
+	return 0
+}
+
+func runWFA(args []string) int {
+	fs := flag.NewFlagSet("wfa", flag.ContinueOnError)
+	symbol := fs.String("symbol", "XAU/USD", "symbol")
+	interval := fs.String("interval", "15m", "interval")
+	is := fs.Int("is-months", 6, "in-sample window months")
+	oos := fs.Int("oos-months", 2, "out-of-sample window months")
+	step := fs.Int("step-months", 2, "rolling step in months")
+	threshold := fs.Float64("threshold", 2.0, "composite |NetWeight| threshold for OOS")
+	useBias := fs.Bool("bias", true, "apply H4 EMA bias filter inside each window")
+	atrMult := fs.Float64("atr-mult", 1.5, "ATR SL widening multiplier (0 disables)")
+	h4Period := fs.Int("h4-period", 200, "EMA period for the H4 bias")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	ctx := context.Background()
+	pool, err := openPool(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "db: %v\n", err)
+		return 1
+	}
+	defer pool.Close()
+
+	cfg := WFAConfig{
+		Symbol: *symbol, Interval: *interval,
+		ISWindowMonths: *is, OOSWindowMonths: *oos, StepMonths: *step,
+		Threshold: *threshold, UseBias: *useBias, ATRMult: *atrMult, H4Period: *h4Period,
+	}
+	res, err := RunWFA(ctx, pool, cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "wfa: %v\n", err)
+		return 1
+	}
+
+	fmt.Printf("\n═══ Walk-Forward Analysis — %s %s ═══\n", *symbol, *interval)
+	fmt.Printf("  IS=%dmo  OOS=%dmo  step=%dmo  threshold=%.2f  bias=%t  atrMult=%.2f\n\n",
+		*is, *oos, *step, *threshold, *useBias, *atrMult)
+	fmt.Printf("  %-3s  %-19s  %-19s  %-5s  %-7s  %-7s  %-7s\n",
+		"#", "OOS Start", "OOS End", "N", "WR%", "NetR", "Sharpe")
+	for i, w := range res.Windows {
+		fmt.Printf("  %-3d  %-19s  %-19s  %-5d  %6.1f  %+7.2f  %+7.2f\n",
+			i+1,
+			w.OOSStart.Format("2006-01-02 15:04"),
+			w.OOSEnd.Format("2006-01-02 15:04"),
+			len(w.OOSTrades), w.OOSWinRate*100, w.OOSNetR, w.OOSSharpe)
+	}
+
+	fmt.Printf("\n── Combined OOS curve (concatenated) ────────────────────────\n")
+	if res.WindowsCount == 0 || len(res.CombinedTrades) == 0 {
+		fmt.Println("  No OOS trades — widen the window, lower the threshold, or check data coverage.")
+		return 0
+	}
+	s := res.CombinedStats
+	pf := fmt.Sprintf("%.2f", s.ProfitFactor)
+	if math.IsInf(s.ProfitFactor, 1) {
+		pf = "∞"
+	}
+	fmt.Printf("  Trades=%d  WR=%.1f%%  NetR=%+.2f  PF=%s  MaxDD=%.1f%%  Sharpe=%.2f  Calmar=%.2f\n",
+		s.Total, s.WinRate*100, s.NetR, pf, s.MaxDDPct*100, s.Sharpe, s.Calmar)
+	fmt.Printf("  Balance: $%.0f → $%.0f (%+.2f%%)\n",
+		s.StartBalance, s.EndBalance, (s.EndBalance-s.StartBalance)/s.StartBalance*100)
 	return 0
 }
 
