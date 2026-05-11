@@ -21,12 +21,20 @@ import (
 type Config struct {
 	// StartCapital — initial bankroll (USD).
 	StartCapital float64
-	// FirstRiskPct — fraction of current capital risked on the first trade
-	// of the day. 0.333 means "risk 33.3% of whatever I have right now".
+	// FirstRiskPct — fraction of capital risked on the first trade of
+	// the day, computed against the capital at day-start. 0.333 means
+	// "risk 33.3% of what I started the day with".
 	FirstRiskPct float64
-	// MartingaleRiskPct — fraction of REMAINING capital risked on the
-	// second trade if the first lost. Martingale-style doubling-down.
-	// 0.666 means "risk 66.6% of what's left after the first loss".
+	// MartingaleRiskPct — fraction of DAY-START capital risked on the
+	// second trade if the first lost. This is the CANONICAL martingale
+	// (double the original bet): if first risk was 33.3% of day-start,
+	// the martingale is 2× that = 66.6% of day-start. Two SL hits in a
+	// row burn 99.9% of the day's capital — by design, not by accident.
+	//
+	// Computing against day-start (not current capital) is what every
+	// martingale gambling model assumes. Computing against post-loss
+	// capital would softly cushion every bust, which is exactly the
+	// false-comfort bug the earlier version had.
 	MartingaleRiskPct float64
 	// MaxTradesPerDay — hard cap on attempts per day. 2 = one martingale.
 	MaxTradesPerDay int
@@ -119,7 +127,7 @@ func Simulate(strategyName string, trades []core.Trade, cfg Config) Result {
 		dayUsed      int  // 0=untouched, 1=first taken, 2=martingale taken
 		martingaleOK bool // first trade today lost → eligible for martingale
 		freeAt       time.Time
-		prevDayStart float64
+		prevDayStart float64 // capital at the start of the current day
 	)
 
 	// tallyDay closes out the books for currentDay: counts win/loss day
@@ -161,8 +169,9 @@ func Simulate(strategyName string, trades []core.Trade, cfg Config) Result {
 
 		switch dayUsed {
 		case 0:
-			// First (and possibly only) trade of the day.
-			risk := cfg.FirstRiskPct * capital
+			// First (and possibly only) trade of the day. Risk is
+			// computed against THIS day's starting capital.
+			risk := cfg.FirstRiskPct * prevDayStart
 			capital += t.R * risk
 			dayUsed = 1
 			freeAt = t.ExitTime
@@ -171,10 +180,14 @@ func Simulate(strategyName string, trades []core.Trade, cfg Config) Result {
 
 		case 1:
 			// Martingale slot — only if the first lost AND user opted in.
+			// Canonical martingale: risk is computed against DAY-START
+			// capital, not against the post-loss capital. So if
+			// FirstRiskPct=33.3% and MartingaleRiskPct=66.6%, two SLs in
+			// a row really do consume 99.9% of the day's bankroll.
 			if !martingaleOK || cfg.MaxTradesPerDay < 2 {
 				continue
 			}
-			risk := cfg.MartingaleRiskPct * capital
+			risk := cfg.MartingaleRiskPct * prevDayStart
 			capital += t.R * risk
 			dayUsed = 2
 			freeAt = t.ExitTime
