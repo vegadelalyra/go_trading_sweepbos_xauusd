@@ -69,7 +69,23 @@ func LoadWeights(ctx context.Context, pool *pgxpool.Pool, runID int64) ([]Strate
 		sw.Weight = sharpeWeight(sw.Expectancy, sw.StdDev, sw.Trades)
 		out = append(out, sw)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Force-silence strategies whose recent Profit Factor has decayed —
+	// long-term edge alone is not enough if the latest window says the
+	// market has changed.
+	decayed, err := DetectAlphaDecay(ctx, pool, runID, DefaultDecayWindowTrades)
+	if err != nil {
+		return nil, fmt.Errorf("detect alpha decay: %w", err)
+	}
+	for i := range out {
+		if decayed[out[i].Strategy] {
+			out[i].Weight = 0
+		}
+	}
+	return out, nil
 }
 
 // sharpeWeight implements the variance-aware weight formula used by both
@@ -143,6 +159,79 @@ func LoadWeightsBySession(ctx context.Context, pool *pgxpool.Pool, runID int64) 
 // is judged too sparse to weight reliably. Tuned for the 2y dataset; in
 // a longer history this could climb without losing too many cells.
 const MinPerSessionTrades = 10
+
+// DecayThreshold is the fraction of historic Profit Factor below which a
+// strategy is judged to have lost its edge in the recent window.
+// 0.6 ≈ "two-thirds of the original edge has evaporated".
+const DecayThreshold = 0.6
+
+// DefaultDecayWindowTrades is the count of most-recent trades that define
+// the "recent" window for alpha-decay detection. 80 is empirically a good
+// balance — short enough to react to regime shifts within a quarter,
+// long enough to filter noise on lower-frequency strategies.
+const DefaultDecayWindowTrades = 80
+
+// DetectAlphaDecay returns the names of strategies whose recent Profit
+// Factor has dropped below DecayThreshold × their long-term Profit Factor
+// in the same backtest run. Strategies need at least 2× windowTrades of
+// history before they are eligible — otherwise the "historic" baseline is
+// indistinguishable from the recent window.
+//
+// LoadWeights consults this set and force-silences any strategy that
+// appears in it (weight = 0) regardless of cumulative expectancy. Without
+// this guard, a strategy that traded profitably for a year and then drifted
+// into a six-month rut keeps voting in the composite at its long-term weight.
+func DetectAlphaDecay(ctx context.Context, pool *pgxpool.Pool, runID int64, windowTrades int) (map[string]bool, error) {
+	if windowTrades <= 0 {
+		windowTrades = DefaultDecayWindowTrades
+	}
+	rows, err := pool.Query(ctx, `
+		WITH numbered AS (
+			SELECT strategy, r_realized,
+				ROW_NUMBER() OVER (PARTITION BY strategy ORDER BY entry_time DESC) AS rn
+			FROM backtest_trades
+			WHERE run_id = $1
+		),
+		recent AS (
+			SELECT strategy,
+				SUM(CASE WHEN r_realized > 0 THEN r_realized      ELSE 0 END) AS gross_win,
+				SUM(CASE WHEN r_realized < 0 THEN -r_realized     ELSE 0 END) AS gross_loss
+			FROM numbered
+			WHERE rn <= $2
+			GROUP BY strategy
+		),
+		historic AS (
+			SELECT strategy,
+				SUM(CASE WHEN r_realized > 0 THEN r_realized  ELSE 0 END) /
+					NULLIF(SUM(CASE WHEN r_realized < 0 THEN -r_realized ELSE 0 END), 0) AS pf,
+				COUNT(*) AS n
+			FROM numbered
+			GROUP BY strategy
+			HAVING COUNT(*) >= $2 * 2
+		)
+		SELECT h.strategy, h.pf, (r.gross_win / NULLIF(r.gross_loss, 0)) AS recent_pf
+		FROM historic h JOIN recent r USING (strategy)
+		WHERE r.gross_loss > 0
+	`, runID, windowTrades)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	decayed := map[string]bool{}
+	for rows.Next() {
+		var strat string
+		var histPF, recentPF float64
+		if err := rows.Scan(&strat, &histPF, &recentPF); err != nil {
+			return nil, err
+		}
+		// Only flag if the historic edge was real to begin with.
+		if histPF > 1.0 && recentPF < histPF*DecayThreshold {
+			decayed[strat] = true
+		}
+	}
+	return decayed, rows.Err()
+}
 
 // CompositeSignal is the meta-strategy's verdict for one candle. It always
 // reports both sides' weights so the caller sees how decisive the vote was.
