@@ -33,6 +33,8 @@ type WFAConfig struct {
 	ATRMult         float64
 	H4Period        int
 	PDLookback      int // Premium/Discount filter lookback in candles (0 disables)
+	Slippage        float64
+	SlippageNewsMult float64
 }
 
 // WFAWindow holds one IS→OOS slice plus the OOS-side performance.
@@ -106,6 +108,8 @@ func RunWFA(ctx context.Context, pool *pgxpool.Pool, cfg WFAConfig) (WFAResult, 
 			params.ATRPeriod = 14
 		}
 		params.PDLookback = cfg.PDLookback
+		params.SlippagePoints = cfg.Slippage
+		params.SlippageNewsMult = cfg.SlippageNewsMult
 
 		isResult := RunBacktest(isCandles, strategy.All(), params)
 		weightsList := computeWeights(isResult.Trades)
@@ -220,10 +224,17 @@ func simulateOOS(candles []Candle, p BacktestParams, weights map[string]float64,
 
 		if open != nil {
 			closed := false
+			slip := slPenalty(p, c.Time)
 			if open.Side == Long {
 				if c.Low <= open.SL {
-					open.ExitPrice = open.SL - p.SpreadDollar
-					open.R = -1
+					exit := open.SL - slip
+					if c.Low < exit {
+						exit = c.Low
+					}
+					open.ExitPrice = exit - p.SpreadDollar
+					riskDist := open.Entry - open.SL
+					actualLoss := open.Entry - exit + p.SpreadDollar
+					open.R = -actualLoss / riskDist
 					open.Win = false
 					closed = true
 				} else if c.High >= open.TP {
@@ -234,8 +245,14 @@ func simulateOOS(candles []Candle, p BacktestParams, weights map[string]float64,
 				}
 			} else {
 				if c.High >= open.SL {
-					open.ExitPrice = open.SL + p.SpreadDollar
-					open.R = -1
+					exit := open.SL + slip
+					if c.High > exit {
+						exit = c.High
+					}
+					open.ExitPrice = exit + p.SpreadDollar
+					riskDist := open.SL - open.Entry
+					actualLoss := exit - open.Entry + p.SpreadDollar
+					open.R = -actualLoss / riskDist
 					open.Win = false
 					closed = true
 				} else if c.Low <= open.TP {

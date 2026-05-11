@@ -27,6 +27,13 @@ type BacktestParams struct {
 	// range, shorts only in the upper half — the smart-money "buy
 	// discount, sell premium" heuristic. 96 = 24h on 15m.
 	PDLookback int
+	// Stochastic SL slippage. SlippagePoints is the dollar penalty applied
+	// to the exit price when an SL hits — gold often gaps a few cents past
+	// the stop in fast markets. SlippageNewsMult multiplies that penalty
+	// during high-vol windows (NY 08-10 and 14, the typical news prints).
+	// Both default to 0 / 1 so existing tunings stay unchanged.
+	SlippagePoints   float64
+	SlippageNewsMult float64
 }
 
 func DefaultParams() BacktestParams {
@@ -139,10 +146,17 @@ func RunBacktest(candles []Candle, strategies []strategy.Strategy, p BacktestPar
 
 		if open != nil {
 			closed := false
+			slip := slPenalty(p, c.Time)
 			if open.Side == Long {
 				if c.Low <= open.SL {
-					open.ExitPrice = open.SL - p.SpreadDollar
-					open.R = -1
+					exit := open.SL - slip
+					if c.Low < exit {
+						exit = c.Low
+					}
+					open.ExitPrice = exit - p.SpreadDollar
+					riskDist := open.Entry - open.SL
+					actualLoss := open.Entry - exit + p.SpreadDollar
+					open.R = -actualLoss / riskDist
 					open.Win = false
 					closed = true
 				} else if c.High >= open.TP {
@@ -153,8 +167,14 @@ func RunBacktest(candles []Candle, strategies []strategy.Strategy, p BacktestPar
 				}
 			} else {
 				if c.High >= open.SL {
-					open.ExitPrice = open.SL + p.SpreadDollar
-					open.R = -1
+					exit := open.SL + slip
+					if c.High > exit {
+						exit = c.High
+					}
+					open.ExitPrice = exit + p.SpreadDollar
+					riskDist := open.SL - open.Entry
+					actualLoss := exit - open.Entry + p.SpreadDollar
+					open.R = -actualLoss / riskDist
 					open.Win = false
 					closed = true
 				} else if c.Low <= open.TP {
@@ -380,6 +400,30 @@ func bumpStats(m map[string]StrategyStats, key string, t Trade) {
 		s.WinRate = float64(s.Wins) / float64(s.Total)
 	}
 	m[key] = s
+}
+
+// slPenalty returns the dollar slippage applied to an SL-hit exit price for
+// candle c. Default (SlippagePoints == 0) preserves the old behaviour of
+// filling at the SL exactly. When set, the engine pretends price gapped a
+// few cents past the stop — and multiplies the penalty during the news
+// windows that produce most gold gap-and-go moves.
+func slPenalty(p BacktestParams, t time.Time) float64 {
+	if p.SlippagePoints <= 0 {
+		return 0
+	}
+	if isHighVolatilityWindow(t) && p.SlippageNewsMult > 0 {
+		return p.SlippagePoints * p.SlippageNewsMult
+	}
+	return p.SlippagePoints
+}
+
+// isHighVolatilityWindow flags the NY hours where US data, equity opens
+// and overlapping liquidity print most of gold's intraday range-extension
+// moves: 08 (early macro releases), 09 (cash open), 10 (ISM/JOLTS slot)
+// and 14 (FOMC / PPI / late releases).
+func isHighVolatilityWindow(t time.Time) bool {
+	h := toNY(t).Hour()
+	return h == 8 || h == 9 || h == 10 || h == 14
 }
 
 // sessionATRScale returns the multiplier applied to BacktestParams.ATRMult
