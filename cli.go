@@ -334,6 +334,7 @@ func runSignal(args []string) int {
 	threshold := fs.Float64("threshold", 2.0, "min |net weight| required to recommend")
 	capital := fs.Float64("capital", 0, "USD to risk; if >0, compute Admirals units & margin")
 	scanBack := fs.Int("scan-back", 0, "also scan the last N candles for any recommended signals")
+	bySession := fs.Bool("by-session", false, "use per-session weights instead of the global table")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -354,13 +355,6 @@ func runSignal(args []string) int {
 			return 1
 		}
 	}
-	ws, err := LoadWeights(ctx, pool, id)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "load weights: %v\n", err)
-		return 1
-	}
-	weights := WeightMap(ws)
-
 	candles, err := loadCandles(ctx, pool, *symbol, *interval, time.Time{}, time.Time{})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load candles: %v\n", err)
@@ -372,8 +366,32 @@ func runSignal(args []string) int {
 	}
 	a := Analyze(candles)
 
-	// First, always report the current candle.
-	cs := ComposeSignal(candles, a, len(candles)-1, weights, *threshold)
+	// Two compose modes share the rest of the runSignal loop. compose is
+	// closed over either weights map so the call site stays uniform.
+	var compose func(i int) CompositeSignal
+	if *bySession {
+		ws, err := LoadWeightsBySession(ctx, pool, id)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load weights-by-session: %v\n", err)
+			return 1
+		}
+		compose = func(i int) CompositeSignal {
+			return ComposeSignalBySession(candles, a, i, ws, *threshold)
+		}
+	} else {
+		ws, err := LoadWeights(ctx, pool, id)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load weights: %v\n", err)
+			return 1
+		}
+		weights := WeightMap(ws)
+		compose = func(i int) CompositeSignal {
+			return ComposeSignal(candles, a, i, weights, *threshold)
+		}
+	}
+
+	// Always report the current candle.
+	cs := compose(len(candles) - 1)
 	printCompositeSignal(*symbol, *interval, candles[len(candles)-1], cs, id, *threshold, *capital)
 
 	// Optional: walk back N candles looking for the most recent
@@ -386,7 +404,7 @@ func runSignal(args []string) int {
 			start = 0
 		}
 		for k := len(candles) - 1; k >= start; k-- {
-			c := ComposeSignal(candles, a, k, weights, *threshold)
+			c := compose(k)
 			if !c.Recommended {
 				continue
 			}

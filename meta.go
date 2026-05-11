@@ -91,6 +91,59 @@ func WeightMap(ws []StrategyWeight) map[string]float64 {
 	return m
 }
 
+// LoadWeightsBySession returns weights keyed by [strategy][session]. The
+// motivation is that a strategy's edge often concentrates in a specific
+// session (BollingerRev can be strong in Asia but a coin flip in NY-AM);
+// a single global weight smears those facts together. Sessions without
+// enough samples (< MinPerSessionTrades) are dropped — partial coverage
+// is better than weighting on noise.
+//
+// The map is sparse: ComposeSignalBySession reads weights[strat][sess] and
+// treats a missing entry as 0 (= strategy silent in that session).
+func LoadWeightsBySession(ctx context.Context, pool *pgxpool.Pool, runID int64) (map[string]map[string]float64, error) {
+	rows, err := pool.Query(ctx, `
+		SELECT
+			strategy,
+			session,
+			COUNT(*)::int                                AS trades,
+			AVG(r_realized)::float8                      AS expectancy,
+			COALESCE(STDDEV_POP(r_realized), 0)::float8  AS stddev_r
+		FROM backtest_trades
+		WHERE run_id = $1
+		GROUP BY strategy, session
+		HAVING COUNT(*) >= $2
+		ORDER BY strategy, session
+	`, runID, MinPerSessionTrades)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[string]map[string]float64{}
+	for rows.Next() {
+		var strat, sess string
+		var trades int
+		var exp, stddev float64
+		if err := rows.Scan(&strat, &sess, &trades, &exp, &stddev); err != nil {
+			return nil, err
+		}
+		w := sharpeWeight(exp, stddev, trades)
+		if w <= 0 {
+			continue
+		}
+		if out[strat] == nil {
+			out[strat] = map[string]float64{}
+		}
+		out[strat][sess] = w
+	}
+	return out, rows.Err()
+}
+
+// MinPerSessionTrades is the floor below which a (strategy, session) cell
+// is judged too sparse to weight reliably. Tuned for the 2y dataset; in
+// a longer history this could climb without losing too many cells.
+const MinPerSessionTrades = 10
+
 // CompositeSignal is the meta-strategy's verdict for one candle. It always
 // reports both sides' weights so the caller sees how decisive the vote was.
 type CompositeSignal struct {
@@ -150,6 +203,64 @@ func ComposeSignal(candles []Candle, a Analysis, i int, weights map[string]float
 		cs.Confidence = math.Abs(cs.NetWeight) / total
 	}
 
+	if cs.NetWeight >= threshold && bestLong != nil {
+		cs.Side = Long
+		cs.Recommended = true
+		cs.BestEntry = bestLong.Signal.Entry
+		cs.BestSL = bestLong.Signal.SL
+		cs.BestTP = bestLong.Signal.TP
+	} else if -cs.NetWeight >= threshold && bestShort != nil {
+		cs.Side = Short
+		cs.Recommended = true
+		cs.BestEntry = bestShort.Signal.Entry
+		cs.BestSL = bestShort.Signal.SL
+		cs.BestTP = bestShort.Signal.TP
+	}
+	return cs
+}
+
+// ComposeSignalBySession is the per-session-aware companion to ComposeSignal.
+// Instead of a flat weights map it reads weightsBySession[strategy][session]
+// using the candle's classified session — so BollingerRev can vote in Asia
+// while staying silent in NY-AM, and vice versa.
+//
+// Same threshold and best-entry tie-break as ComposeSignal; only the weight
+// lookup differs.
+func ComposeSignalBySession(candles []Candle, a Analysis, i int, weightsBySession map[string]map[string]float64, threshold float64) CompositeSignal {
+	cs := CompositeSignal{}
+	var bestLong, bestShort *TaggedSignal
+	sess := classifySession(candles[i].Time)
+	for _, s := range strategy.All() {
+		sig, ok := s.Detect(candles, a, i)
+		if !ok {
+			continue
+		}
+		w := 0.0
+		if perSess, ok := weightsBySession[sig.Strategy]; ok {
+			w = perSess[sess]
+		}
+		if w <= 0 {
+			continue
+		}
+		ts := TaggedSignal{Signal: sig, Weight: w}
+		cs.Triggers = append(cs.Triggers, ts)
+		if sig.Side == Long {
+			cs.LongWeight += w
+			if bestLong == nil || w > bestLong.Weight {
+				bestLong = &ts
+			}
+		} else {
+			cs.ShortWeight += w
+			if bestShort == nil || w > bestShort.Weight {
+				bestShort = &ts
+			}
+		}
+	}
+	cs.NetWeight = cs.LongWeight - cs.ShortWeight
+	total := cs.LongWeight + cs.ShortWeight
+	if total > 0 {
+		cs.Confidence = math.Abs(cs.NetWeight) / total
+	}
 	if cs.NetWeight >= threshold && bestLong != nil {
 		cs.Side = Long
 		cs.Recommended = true
