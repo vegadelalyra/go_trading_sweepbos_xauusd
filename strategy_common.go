@@ -31,7 +31,7 @@ var Strategies = []StrategyFn{
 	EMACross,
 	BollingerReversal,
 	DailyBreakout,
-	XAUXAGPairs, // inactive until XAGCandles is populated.
+	XAUXAGPairs, // inactive until xasset.XAUXAGPairsInstance.SetXAG is called.
 }
 
 // Bare-name shims for legacy strategies that still live in `package main`.

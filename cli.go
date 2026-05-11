@@ -12,6 +12,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/joho/godotenv"
+
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy/xasset"
 )
 
 // run is the CLI dispatcher invoked from main().
@@ -272,7 +274,7 @@ func runBacktestCLI(args []string) int {
 		if err != nil || len(xag) == 0 {
 			fmt.Fprintf(os.Stderr, "XAG data unavailable — XAUXAGPairs will stay inactive\n")
 		} else {
-			XAGCandles = xag
+			xasset.XAUXAGPairsInstance.SetXAG(xag)
 			fmt.Printf("XAG candles loaded (%d 1h bars) — XAUXAGPairs active\n", len(xag))
 		}
 	}
