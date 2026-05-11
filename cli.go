@@ -13,8 +13,11 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/joho/godotenv"
 
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/bias"
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/core"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/engine"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/meta"
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/smc"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy/xasset"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/wfa"
@@ -273,7 +276,7 @@ func runBacktestCLI(args []string) int {
 		if len(h4) < *h4Period+10 {
 			fmt.Fprintf(os.Stderr, "not enough H4 candles (%d) for bias period %d\n", len(h4), *h4Period)
 		} else {
-			params.H4Bias = BuildBiasMap(h4, *h4Period, 4*time.Hour)
+			params.H4Bias = bias.BuildBiasMap(h4, *h4Period, 4*time.Hour)
 			fmt.Printf("Bias filter ON  (H4 EMA%d, %d bars)\n", *h4Period, len(h4))
 		}
 	}
@@ -385,7 +388,7 @@ func runSignal(args []string) int {
 		fmt.Fprintf(os.Stderr, "not enough candles (%d) — run backfill first\n", len(candles))
 		return 1
 	}
-	a := Analyze(candles)
+	a := smc.Analyze(candles)
 
 	// Two compose modes share the rest of the runSignal loop. compose is
 	// closed over either weights map so the call site stays uniform.
@@ -485,7 +488,7 @@ func runWFA(args []string) int {
 		fmt.Fprintf(os.Stderr, "load candles: %v\n", err)
 		return 1
 	}
-	var h4Candles []Candle
+	var h4Candles []core.Candle
 	if cfg.UseBias {
 		h4Candles, err = loadCandles(ctx, pool, cfg.Symbol, "4h", cfg.StartDate, cfg.EndDate)
 		if err != nil {
@@ -561,7 +564,7 @@ func runBootstrap(args []string) int {
 	defer pool.Close()
 
 	var (
-		trades []Trade
+		trades []core.Trade
 		header string
 	)
 	if *wfaRunID != 0 {

@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/core"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/engine"
 )
 
@@ -35,7 +36,7 @@ func buildBacktestReport(symbol, interval string, r engine.BacktestResult) strin
 
 	if len(s.BySession) > 0 {
 		fmt.Fprintln(&b, "\n── By Session (winrate% / netR / n) ─────────────────────────")
-		sessions := []string{SessionAsia, SessionLondon, SessionNYAM, SessionNYPM, SessionOff}
+		sessions := []string{core.SessionAsia, core.SessionLondon, core.SessionNYAM, core.SessionNYPM, core.SessionOff}
 		fmt.Fprintf(&b, "  %-14s", "Strategy")
 		for _, sess := range sessions {
 			fmt.Fprintf(&b, "  %-16s", sess)

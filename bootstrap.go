@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/core"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/metrics"
 )
 
@@ -35,7 +36,7 @@ type BootstrapResult struct {
 //	meanBlockLen  expected block length (30-50 trades typical)
 //	startBalance  base equity for the simulated MaxDD walk
 //	riskPct       fraction of equity risked per trade (matches BacktestParams.RiskPct)
-func StationaryBlockBootstrap(trades []Trade, iterations int, meanBlockLen, startBalance, riskPct float64) BootstrapResult {
+func StationaryBlockBootstrap(trades []core.Trade, iterations int, meanBlockLen, startBalance, riskPct float64) BootstrapResult {
 	if len(trades) < 30 || iterations < 100 {
 		return BootstrapResult{}
 	}
@@ -49,7 +50,7 @@ func StationaryBlockBootstrap(trades []Trade, iterations int, meanBlockLen, star
 
 	N := len(trades)
 	for it := 0; it < iterations; it++ {
-		resample := make([]Trade, 0, N)
+		resample := make([]core.Trade, 0, N)
 		for len(resample) < N {
 			start := rng.Intn(N)
 			for {
@@ -123,7 +124,7 @@ func quantile95(xs []float64) (mean, low, high float64) {
 // loadBacktestTrades pulls the realised trades of a stored run into the
 // in-memory Trade type. Only the fields the bootstrap needs (R, Win,
 // EntryTime, ExitTime) are populated.
-func loadBacktestTrades(ctx context.Context, pool *pgxpool.Pool, runID int64) ([]Trade, error) {
+func loadBacktestTrades(ctx context.Context, pool *pgxpool.Pool, runID int64) ([]core.Trade, error) {
 	rows, err := pool.Query(ctx, `
 		SELECT strategy, side, r_realized, win, entry_time, exit_time
 		FROM backtest_trades
@@ -135,17 +136,17 @@ func loadBacktestTrades(ctx context.Context, pool *pgxpool.Pool, runID int64) ([
 	}
 	defer rows.Close()
 
-	var out []Trade
+	var out []core.Trade
 	for rows.Next() {
-		var t Trade
+		var t core.Trade
 		var sideStr string
 		if err := rows.Scan(&t.Strategy, &sideStr, &t.R, &t.Win, &t.EntryTime, &t.ExitTime); err != nil {
 			return nil, err
 		}
 		if sideStr == "SHORT" {
-			t.Side = Short
+			t.Side = core.Short
 		} else {
-			t.Side = Long
+			t.Side = core.Long
 		}
 		out = append(out, t)
 	}
@@ -156,7 +157,7 @@ func loadBacktestTrades(ctx context.Context, pool *pgxpool.Pool, runID int64) ([
 // Ordered by entry_time so the geometric-block resampler sees the same
 // chronology the live system would. Same field surface as loadBacktestTrades
 // — only the source table differs.
-func loadWFATrades(ctx context.Context, pool *pgxpool.Pool, wfaRunID int64) ([]Trade, error) {
+func loadWFATrades(ctx context.Context, pool *pgxpool.Pool, wfaRunID int64) ([]core.Trade, error) {
 	rows, err := pool.Query(ctx, `
 		SELECT strategy, side, r_realized, win, entry_time, exit_time
 		FROM wfa_trades
@@ -168,17 +169,17 @@ func loadWFATrades(ctx context.Context, pool *pgxpool.Pool, wfaRunID int64) ([]T
 	}
 	defer rows.Close()
 
-	var out []Trade
+	var out []core.Trade
 	for rows.Next() {
-		var t Trade
+		var t core.Trade
 		var sideStr string
 		if err := rows.Scan(&t.Strategy, &sideStr, &t.R, &t.Win, &t.EntryTime, &t.ExitTime); err != nil {
 			return nil, err
 		}
 		if sideStr == "SHORT" {
-			t.Side = Short
+			t.Side = core.Short
 		} else {
-			t.Side = Long
+			t.Side = core.Long
 		}
 		out = append(out, t)
 	}

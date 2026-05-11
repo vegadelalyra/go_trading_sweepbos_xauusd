@@ -7,8 +7,10 @@ import (
 	"os"
 	"time"
 
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/core"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/livefeed"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/meta"
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/smc"
 )
 
 // runLiveSignal implements the `live-signal` subcommand: subscribe to the
@@ -55,14 +57,14 @@ func runLiveSignal(args []string) int {
 	}
 
 	// Resolve composer ONCE — the polled goroutine reuses it on every tick.
-	var compose func(candles []Candle, a Analysis, i int) meta.CompositeSignal
+	var compose func(candles []core.Candle, a smc.Analysis, i int) meta.CompositeSignal
 	if *bySession {
 		ws, err := meta.LoadWeightsBySession(ctx, pool, id)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "load weights-by-session: %v\n", err)
 			return 1
 		}
-		compose = func(c []Candle, a Analysis, i int) meta.CompositeSignal {
+		compose = func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
 			return meta.ComposeSignalBySession(c, a, i, ws, *threshold)
 		}
 	} else {
@@ -72,7 +74,7 @@ func runLiveSignal(args []string) int {
 			return 1
 		}
 		wm := meta.WeightMap(ws)
-		compose = func(c []Candle, a Analysis, i int) meta.CompositeSignal {
+		compose = func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
 			return meta.ComposeSignal(c, a, i, wm, *threshold)
 		}
 	}
@@ -105,7 +107,7 @@ func runLiveSignal(args []string) int {
 			fmt.Fprintf(os.Stderr, "not enough candles (%d) — run backfill\n", len(candles))
 			return
 		}
-		a := Analyze(candles)
+		a := smc.Analyze(candles)
 		cs := compose(candles, a, len(candles)-1)
 		now := candles[len(candles)-1].Time
 		if cs.Recommended && !now.Equal(lastRecommendedAt) {

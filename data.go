@@ -9,6 +9,8 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/core"
 )
 
 const (
@@ -49,7 +51,7 @@ func tdInterval(interval string) string {
 // If endDate is zero, retrieves the most recent candles. Otherwise retrieves
 // candles ending at endDate (exclusive upper bound from TD's perspective).
 // Returns candles in chronological order (oldest first).
-func fetchPage(ctx context.Context, httpc *http.Client, apiKey, symbol, interval string, endDate time.Time, outputSize int) ([]Candle, error) {
+func fetchPage(ctx context.Context, httpc *http.Client, apiKey, symbol, interval string, endDate time.Time, outputSize int) ([]core.Candle, error) {
 	q := url.Values{}
 	q.Set("symbol", symbol)
 	q.Set("interval", tdInterval(interval))
@@ -85,7 +87,7 @@ func fetchPage(ctx context.Context, httpc *http.Client, apiKey, symbol, interval
 	}
 
 	n := len(data.Values)
-	out := make([]Candle, 0, n)
+	out := make([]core.Candle, 0, n)
 	// TD returns newest-first; reverse to oldest-first.
 	for i := n - 1; i >= 0; i-- {
 		v := data.Values[i]
@@ -103,27 +105,27 @@ func fetchPage(ctx context.Context, httpc *http.Client, apiKey, symbol, interval
 		if err != nil {
 			continue
 		}
-		out = append(out, Candle{Time: t, Open: o, High: h, Low: l, Close: c})
+		out = append(out, core.Candle{Time: t, Open: o, High: h, Low: l, Close: c})
 	}
 	return out, nil
 }
 
 // fetchCandles is kept as the legacy helper used by the live/historic modes
 // in the TUI. It defaults to the XAU/USD 15m feed.
-func fetchCandles(httpc *http.Client, apiKey string, size int) ([]Candle, error) {
+func fetchCandles(httpc *http.Client, apiKey string, size int) ([]core.Candle, error) {
 	return fetchPage(context.Background(), httpc, apiKey, Symbol, "15m", time.Time{}, size)
 }
 
 // loadCacheJSON / saveCacheJSON are retained so we can one-shot import the
 // legacy JSON dump that pre-dated the Postgres schema. New code should not
 // depend on these.
-func loadCacheJSON(path string) ([]Candle, error) {
+func loadCacheJSON(path string) ([]core.Candle, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	var out []Candle
+	var out []core.Candle
 	if err := json.NewDecoder(f).Decode(&out); err != nil {
 		return nil, err
 	}

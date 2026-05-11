@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/core"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/engine"
 )
 
@@ -45,7 +46,7 @@ func openPool(ctx context.Context) (*pgxpool.Pool, error) {
 
 // upsertCandles inserts (or ignores) candles for (symbol, interval).
 // Returns the number of rows actually inserted (excluding conflicts).
-func upsertCandles(ctx context.Context, pool *pgxpool.Pool, symbol, interval string, candles []Candle) (int, error) {
+func upsertCandles(ctx context.Context, pool *pgxpool.Pool, symbol, interval string, candles []core.Candle) (int, error) {
 	if len(candles) == 0 {
 		return 0, nil
 	}
@@ -90,7 +91,7 @@ func upsertCandles(ctx context.Context, pool *pgxpool.Pool, symbol, interval str
 
 // loadCandles returns candles for (symbol, interval) within the optional time range.
 // Use zero time.Time as "open-ended" on either side.
-func loadCandles(ctx context.Context, pool *pgxpool.Pool, symbol, interval string, from, to time.Time) ([]Candle, error) {
+func loadCandles(ctx context.Context, pool *pgxpool.Pool, symbol, interval string, from, to time.Time) ([]core.Candle, error) {
 	q := `SELECT bar_time, open, high, low, close FROM ohlc
 	      WHERE symbol = $1 AND interval = $2`
 	args := []any{symbol, interval}
@@ -113,9 +114,9 @@ func loadCandles(ctx context.Context, pool *pgxpool.Pool, symbol, interval strin
 	}
 	defer rows.Close()
 
-	out := make([]Candle, 0, 1024)
+	out := make([]core.Candle, 0, 1024)
 	for rows.Next() {
-		var c Candle
+		var c core.Candle
 		if err := rows.Scan(&c.Time, &c.Open, &c.High, &c.Low, &c.Close); err != nil {
 			return nil, err
 		}
@@ -133,7 +134,7 @@ type CoverageRow struct {
 
 // saveBacktestRun persists a backtest result: one row in backtest_runs and
 // one row per executed trade in backtest_trades. Returns the new run id.
-func saveBacktestRun(ctx context.Context, pool *pgxpool.Pool, symbol, interval string, candles []Candle, r engine.BacktestResult) (int64, error) {
+func saveBacktestRun(ctx context.Context, pool *pgxpool.Pool, symbol, interval string, candles []core.Candle, r engine.BacktestResult) (int64, error) {
 	if len(candles) == 0 {
 		return 0, fmt.Errorf("no candles in result")
 	}

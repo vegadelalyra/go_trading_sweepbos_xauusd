@@ -15,6 +15,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/core"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/engine"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy"
 )
@@ -51,7 +52,7 @@ type tickMsg time.Time
 
 type candlesMsg struct {
 	mode    viewMode
-	candles []Candle
+	candles []core.Candle
 	cached  bool
 }
 
@@ -97,7 +98,7 @@ type model struct {
 	width     int
 	height    int
 	mode      viewMode
-	candles   []Candle
+	candles   []core.Candle
 	lastPrice float64
 	credits   int
 	loading   bool
@@ -159,7 +160,7 @@ func loadBacktestDataCmd(pool *pgxpool.Pool) tea.Cmd {
 	}
 }
 
-func runBacktestCmd(candles []Candle) tea.Cmd {
+func runBacktestCmd(candles []core.Candle) tea.Cmd {
 	return func() tea.Msg {
 		r := engine.RunBacktest(candles, strategy.All(), engine.DefaultParams())
 		return backtestMsg{result: r}
@@ -439,7 +440,7 @@ func (m model) renderChart(w, h int) string {
 			}
 			x := startX + (t.EntryIdx - startIdx)
 			cdl := candles[t.EntryIdx-startIdx]
-			if t.Side == Long {
+			if t.Side == core.Long {
 				y := priceY(cdl.Low) + 1
 				if y > h-1 {
 					y = h - 1
