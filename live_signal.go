@@ -24,12 +24,18 @@ import (
 func runLiveSignal(args []string) int {
 	fs := flag.NewFlagSet("live-signal", flag.ContinueOnError)
 	runID := fs.Int64("run-id", 0, "backtest_runs.id to source weights (0 = latest)")
+	paperRun := fs.String("paper-run", "", "comma-separated paper_runs.id list to UNION into the weight calc")
 	symbol := fs.String("symbol", "XAU/USD", "symbol")
 	interval := fs.String("interval", "15m", "candle interval for the signal engine")
 	threshold := fs.Float64("threshold", 2.0, "composite |NetWeight| threshold")
 	pollSeconds := fs.Int("poll-seconds", 30, "REST candle poll cadence")
 	bySession := fs.Bool("by-session", false, "use per-session weights")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	paperRunIDs, err := parsePaperRunIDs(*paperRun)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
 
@@ -59,7 +65,7 @@ func runLiveSignal(args []string) int {
 	// Resolve composer ONCE — the polled goroutine reuses it on every tick.
 	var compose func(candles []core.Candle, a smc.Analysis, i int) meta.CompositeSignal
 	if *bySession {
-		ws, err := meta.LoadWeightsBySession(ctx, pool, id)
+		ws, err := meta.LoadWeightsBySession(ctx, pool, id, paperRunIDs...)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "load weights-by-session: %v\n", err)
 			return 1
@@ -68,7 +74,7 @@ func runLiveSignal(args []string) int {
 			return meta.ComposeSignalBySession(c, a, i, ws, *threshold)
 		}
 	} else {
-		ws, err := meta.LoadWeights(ctx, pool, id)
+		ws, err := meta.LoadWeights(ctx, pool, id, paperRunIDs...)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "load weights: %v\n", err)
 			return 1

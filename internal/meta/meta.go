@@ -49,8 +49,24 @@ type StrategyWeight struct {
 // LoadWeights aggregates per-strategy stats from a stored backtest run and
 // returns one StrategyWeight per strategy that traded in that run. The
 // returned slice carries the variance-aware weight described on StrategyWeight.
-func LoadWeights(ctx context.Context, pool *pgxpool.Pool, runID int64) ([]StrategyWeight, error) {
+//
+// When `paperRunIDs` is non-empty, trades from the named paper_runs are
+// UNION-ed into the aggregation — i.e. graded paper-trading outcomes
+// influence the weights alongside the canonical backtest. This is the
+// feedback loop: as paper trading accumulates, the weights drift toward
+// reflecting live conditions (spread, slippage, regime drift) instead of
+// only the static backtest. Pass nil/empty to keep the legacy behaviour.
+func LoadWeights(ctx context.Context, pool *pgxpool.Pool, runID int64, paperRunIDs ...int64) ([]StrategyWeight, error) {
 	rows, err := pool.Query(ctx, `
+		WITH all_trades AS (
+			SELECT strategy, r_realized, win
+			FROM backtest_trades
+			WHERE run_id = $1
+			UNION ALL
+			SELECT strategy, r_realized, win
+			FROM paper_trades
+			WHERE paper_run_id = ANY($2)
+		)
 		SELECT
 			strategy,
 			COUNT(*)::int                                              AS trades,
@@ -58,11 +74,10 @@ func LoadWeights(ctx context.Context, pool *pgxpool.Pool, runID int64) ([]Strate
 			COALESCE(STDDEV_POP(r_realized), 0)::float8                AS stddev_r,
 			(COUNT(*) FILTER (WHERE win))::float8 / COUNT(*)::float8   AS winrate,
 			SUM(r_realized)::float8                                    AS net_r
-		FROM backtest_trades
-		WHERE run_id = $1
+		FROM all_trades
 		GROUP BY strategy
 		ORDER BY strategy
-	`, runID)
+	`, runID, paperRunIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -83,8 +98,10 @@ func LoadWeights(ctx context.Context, pool *pgxpool.Pool, runID int64) ([]Strate
 
 	// Force-silence strategies whose recent Profit Factor has decayed —
 	// long-term edge alone is not enough if the latest window says the
-	// market has changed.
-	decayed, err := DetectAlphaDecay(ctx, pool, runID, DefaultDecayWindowTrades)
+	// market has changed. Decay detection consults the same combined
+	// (backtest + paper) trade stream so paper outcomes can both lift AND
+	// kill a strategy's weight.
+	decayed, err := DetectAlphaDecay(ctx, pool, runID, DefaultDecayWindowTrades, paperRunIDs...)
 	if err != nil {
 		return nil, fmt.Errorf("detect alpha decay: %w", err)
 	}
@@ -124,20 +141,28 @@ func WeightMap(ws []StrategyWeight) map[string]float64 {
 //
 // The map is sparse: ComposeSignalBySession reads weights[strat][sess] and
 // treats a missing entry as 0 (= strategy silent in that session).
-func LoadWeightsBySession(ctx context.Context, pool *pgxpool.Pool, runID int64) (map[string]map[string]float64, error) {
+func LoadWeightsBySession(ctx context.Context, pool *pgxpool.Pool, runID int64, paperRunIDs ...int64) (map[string]map[string]float64, error) {
 	rows, err := pool.Query(ctx, `
+		WITH all_trades AS (
+			SELECT strategy, session, r_realized
+			FROM backtest_trades
+			WHERE run_id = $1
+			UNION ALL
+			SELECT strategy, session, r_realized
+			FROM paper_trades
+			WHERE paper_run_id = ANY($3)
+		)
 		SELECT
 			strategy,
 			session,
 			COUNT(*)::int                                AS trades,
 			AVG(r_realized)::float8                      AS expectancy,
 			COALESCE(STDDEV_POP(r_realized), 0)::float8  AS stddev_r
-		FROM backtest_trades
-		WHERE run_id = $1
+		FROM all_trades
 		GROUP BY strategy, session
 		HAVING COUNT(*) >= $2
 		ORDER BY strategy, session
-	`, runID, MinPerSessionTrades)
+	`, runID, MinPerSessionTrades, paperRunIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -189,16 +214,24 @@ const DefaultDecayWindowTrades = 80
 // appears in it (weight = 0) regardless of cumulative expectancy. Without
 // this guard, a strategy that traded profitably for a year and then drifted
 // into a six-month rut keeps voting in the composite at its long-term weight.
-func DetectAlphaDecay(ctx context.Context, pool *pgxpool.Pool, runID int64, windowTrades int) (map[string]bool, error) {
+func DetectAlphaDecay(ctx context.Context, pool *pgxpool.Pool, runID int64, windowTrades int, paperRunIDs ...int64) (map[string]bool, error) {
 	if windowTrades <= 0 {
 		windowTrades = DefaultDecayWindowTrades
 	}
 	rows, err := pool.Query(ctx, `
-		WITH numbered AS (
-			SELECT strategy, r_realized,
-				ROW_NUMBER() OVER (PARTITION BY strategy ORDER BY entry_time DESC) AS rn
+		WITH all_trades AS (
+			SELECT strategy, r_realized, entry_time
 			FROM backtest_trades
 			WHERE run_id = $1
+			UNION ALL
+			SELECT strategy, r_realized, entry_time
+			FROM paper_trades
+			WHERE paper_run_id = ANY($3)
+		),
+		numbered AS (
+			SELECT strategy, r_realized,
+				ROW_NUMBER() OVER (PARTITION BY strategy ORDER BY entry_time DESC) AS rn
+			FROM all_trades
 		),
 		recent AS (
 			SELECT strategy,
@@ -220,7 +253,7 @@ func DetectAlphaDecay(ctx context.Context, pool *pgxpool.Pool, runID int64, wind
 		SELECT h.strategy, h.pf, (r.gross_win / NULLIF(r.gross_loss, 0)) AS recent_pf
 		FROM historic h JOIN recent r USING (strategy)
 		WHERE r.gross_loss > 0
-	`, runID, windowTrades)
+	`, runID, windowTrades, paperRunIDs)
 	if err != nil {
 		return nil, err
 	}

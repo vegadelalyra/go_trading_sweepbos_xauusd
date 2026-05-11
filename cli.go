@@ -321,10 +321,37 @@ func runBacktestCLI(args []string) int {
 	return 0
 }
 
+// parsePaperRunIDs splits a comma-separated string like "3,7,12" into a
+// []int64 of paper_run IDs. Empty input returns (nil, nil). Used by every
+// subcommand that consumes weights so the paper→weights feedback loop is
+// a single flag away.
+func parsePaperRunIDs(s string) ([]int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]int64, 0, len(parts))
+	for _, p := range parts {
+		v, err := strconv.ParseInt(strings.TrimSpace(p), 10, 64)
+		if err != nil || v <= 0 {
+			return nil, fmt.Errorf("invalid paper-run entry %q: positive integer required", p)
+		}
+		out = append(out, v)
+	}
+	return out, nil
+}
+
 func runWeights(args []string) int {
 	fs := flag.NewFlagSet("weights", flag.ContinueOnError)
 	runID := fs.Int64("run-id", 0, "backtest_runs.id to source weights from (0 = latest)")
+	paperRun := fs.String("paper-run", "", "comma-separated paper_runs.id list to UNION into the weight calc (e.g. \"2,3\")")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	paperRunIDs, err := parsePaperRunIDs(*paperRun)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
 
@@ -344,7 +371,7 @@ func runWeights(args []string) int {
 			return 1
 		}
 	}
-	ws, err := meta.LoadWeights(ctx, pool, id)
+	ws, err := meta.LoadWeights(ctx, pool, id, paperRunIDs...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load weights: %v\n", err)
 		return 1
@@ -357,6 +384,7 @@ func runWeights(args []string) int {
 func runSignal(args []string) int {
 	fs := flag.NewFlagSet("signal", flag.ContinueOnError)
 	runID := fs.Int64("run-id", 0, "backtest_runs.id to source weights (0 = latest)")
+	paperRun := fs.String("paper-run", "", "comma-separated paper_runs.id list to UNION into the weight calc")
 	symbol := fs.String("symbol", "XAU/USD", "symbol")
 	interval := fs.String("interval", "15m", "interval to evaluate")
 	threshold := fs.Float64("threshold", 2.0, "min |net weight| required to recommend")
@@ -364,6 +392,11 @@ func runSignal(args []string) int {
 	scanBack := fs.Int("scan-back", 0, "also scan the last N candles for any recommended signals")
 	bySession := fs.Bool("by-session", false, "use per-session weights instead of the global table")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	paperRunIDs, err := parsePaperRunIDs(*paperRun)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
 
@@ -398,7 +431,7 @@ func runSignal(args []string) int {
 	// closed over either weights map so the call site stays uniform.
 	var compose func(i int) meta.CompositeSignal
 	if *bySession {
-		ws, err := meta.LoadWeightsBySession(ctx, pool, id)
+		ws, err := meta.LoadWeightsBySession(ctx, pool, id, paperRunIDs...)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "load weights-by-session: %v\n", err)
 			return 1
@@ -407,7 +440,7 @@ func runSignal(args []string) int {
 			return meta.ComposeSignalBySession(candles, a, i, ws, *threshold)
 		}
 	} else {
-		ws, err := meta.LoadWeights(ctx, pool, id)
+		ws, err := meta.LoadWeights(ctx, pool, id, paperRunIDs...)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "load weights: %v\n", err)
 			return 1
@@ -639,6 +672,7 @@ func runBootstrap(args []string) int {
 func runPaperReplay(args []string) int {
 	fs := flag.NewFlagSet("paper-replay", flag.ContinueOnError)
 	runID := fs.Int64("run-id", 0, "backtest_runs.id whose weights drive the replay (0 = latest)")
+	paperRun := fs.String("paper-run", "", "comma-separated paper_runs.id list to UNION into the weight calc (iterative paper→paper loop)")
 	symbol := fs.String("symbol", "XAU/USD", "symbol")
 	interval := fs.String("interval", "15m", "interval to replay")
 	fromStr := fs.String("from", "", "lower bound (YYYY-MM-DD); empty = full history")
@@ -653,6 +687,11 @@ func runPaperReplay(args []string) int {
 	bySession := fs.Bool("by-session", false, "use per-session weight table instead of the global one")
 	persist := fs.Bool("persist", false, "store this paper run + every trade in paper_runs/paper_trades")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	paperRunIDs, err := parsePaperRunIDs(*paperRun)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
 
@@ -723,13 +762,13 @@ func runPaperReplay(args []string) int {
 		bySessTbl  map[string]map[string]float64
 	)
 	if *bySession {
-		bySessTbl, err = meta.LoadWeightsBySession(ctx, pool, id)
+		bySessTbl, err = meta.LoadWeightsBySession(ctx, pool, id, paperRunIDs...)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "load weights-by-session: %v\n", err)
 			return 1
 		}
 	} else {
-		ws, err := meta.LoadWeights(ctx, pool, id)
+		ws, err := meta.LoadWeights(ctx, pool, id, paperRunIDs...)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "load weights: %v\n", err)
 			return 1
