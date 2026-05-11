@@ -42,6 +42,13 @@ func BreakerBlock(candles []Candle, a Analysis, i int) (Signal, bool) {
 			if ob.Index >= ev.Index {
 				continue
 			}
+			// The breaker setup requires the OB to have ALREADY existed before
+			// the CHoCh broke it. If the OB's own confirming event sits at or
+			// after ev, the OB was never an independent prior structure for
+			// price to violate — we'd be inventing the breaker from future info.
+			if ob.ResolveIdx >= ev.Index {
+				continue
+			}
 			if ev.Index-ob.Index > 50 {
 				break
 			}

@@ -58,10 +58,11 @@ type StructureEvent struct {
 }
 
 type OrderBlock struct {
-	Index   int
-	Top     float64
-	Bottom  float64
-	Bullish bool
+	Index      int  // candle that forms the OB body (precedes the impulse)
+	ResolveIdx int  // candle whose Close confirmed the OB by triggering BoS/CHoCh
+	Top        float64
+	Bottom     float64
+	Bullish    bool
 }
 
 type Analysis struct {
@@ -288,7 +289,7 @@ func DetectOrderBlocks(candles []Candle, events []StructureEvent, swings []Swing
 			continue
 		}
 
-		out = append(out, OrderBlock{Index: obIdx, Bottom: ob.Low, Top: ob.High, Bullish: bull})
+		out = append(out, OrderBlock{Index: obIdx, ResolveIdx: e.Index, Bottom: ob.Low, Top: ob.High, Bullish: bull})
 	}
 	return out
 }

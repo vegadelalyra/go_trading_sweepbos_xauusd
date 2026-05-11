@@ -30,6 +30,11 @@ func OrderBlockMitigation(candles []Candle, a Analysis, i int) (Signal, bool) {
 		if ob.Index >= i {
 			continue
 		}
+		// The OB only exists in our analysis because a later BoS/CHoCh confirmed
+		// it — using it before ResolveIdx leaks future structure into the trade.
+		if ob.ResolveIdx >= i {
+			continue
+		}
 		age := i - ob.Index
 		if age > 50 {
 			break
