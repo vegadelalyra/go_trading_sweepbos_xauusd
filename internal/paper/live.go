@@ -168,7 +168,7 @@ func RunLive(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig,
 			a := smc.Analyze(candles)
 			cs := compose(candles, a, latestIdx)
 			if cs.Recommended {
-				p, ok := acceptSignal(candles, latestIdx, cs, params)
+				p, ok, reason := acceptSignal(candles, latestIdx, cs, params)
 				if ok {
 					pendID, err := insertPending(ctx, pool, paperRunID, p)
 					if err != nil {
@@ -179,7 +179,7 @@ func RunLive(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig,
 							cs.NetWeight, cs.Confidence*100, cs.WinnerStrategy)
 					}
 				} else {
-					log.Log("composite recommended %s but filters rejected (bias/PD/MaxSL)", cs.Side.String())
+					log.Log("composite %s rejected (winner: %s) — %s", cs.Side.String(), cs.WinnerStrategy, reason)
 				}
 			} else {
 				log.Log("no recommendation (long=%.2f short=%.2f net=%+.2f)",
@@ -293,17 +293,19 @@ func intervalDuration(interval string) time.Duration {
 
 // acceptSignal applies the bias / PD / MaxSL filters that the engine and
 // WFA also apply, then returns the would-be pending position with spread
-// baked into entry. Returns ok=false if any gate rejects.
-func acceptSignal(candles []core.Candle, i int, cs meta.CompositeSignal, p engine.BacktestParams) (pendingPosition, bool) {
+// baked into entry. Returns ok=false if any gate rejects, plus a human
+// reason string so the live logger can tell the operator exactly which
+// filter killed the trade (and at what numbers).
+func acceptSignal(candles []core.Candle, i int, cs meta.CompositeSignal, p engine.BacktestParams) (pendingPosition, bool, string) {
 	c := candles[i]
 	// Bias filter (only when H4Bias is set, which paper-live currently
 	// doesn't enable — placeholder kept for symmetry with engine).
 	if b := p.H4Bias.Lookup(c.Time); b != 0 {
 		if b > 0 && cs.Side == core.Short {
-			return pendingPosition{}, false
+			return pendingPosition{}, false, "H4 bias is BULL but composite voted SHORT"
 		}
 		if b < 0 && cs.Side == core.Long {
-			return pendingPosition{}, false
+			return pendingPosition{}, false, "H4 bias is BEAR but composite voted LONG"
 		}
 	}
 	// PD filter on the composite entry — exempt breakout strategies
@@ -311,10 +313,12 @@ func acceptSignal(candles []core.Candle, i int, cs meta.CompositeSignal, p engin
 	if p.PDLookback > 0 && !strategy.IsBreakout(cs.WinnerStrategy) {
 		dr := smc.CurrentDealingRange(candles, i, p.PDLookback)
 		if cs.Side == core.Long && dr.InPremium(cs.BestEntry) {
-			return pendingPosition{}, false
+			return pendingPosition{}, false, fmt.Sprintf("PD: LONG entry $%.2f is in PREMIUM of %dc range [$%.2f-$%.2f, mid $%.2f]",
+				cs.BestEntry, p.PDLookback, dr.Low, dr.High, dr.Mid)
 		}
 		if cs.Side == core.Short && dr.InDiscount(cs.BestEntry) {
-			return pendingPosition{}, false
+			return pendingPosition{}, false, fmt.Sprintf("PD: SHORT entry $%.2f is in DISCOUNT of %dc range [$%.2f-$%.2f, mid $%.2f]",
+				cs.BestEntry, p.PDLookback, dr.Low, dr.High, dr.Mid)
 		}
 	}
 	// Structural levels straight from the composite — ATR widening is
@@ -325,7 +329,8 @@ func acceptSignal(candles []core.Candle, i int, cs meta.CompositeSignal, p engin
 	entry, sl, tp := cs.BestEntry, cs.BestSL, cs.BestTP
 	// MaxSL guard.
 	if p.MaxSLPoints > 0 && math.Abs(entry-sl) > p.MaxSLPoints {
-		return pendingPosition{}, false
+		return pendingPosition{}, false, fmt.Sprintf("MaxSL: SL distance |$%.2f - $%.2f|=$%.2f exceeds cap $%.2f",
+			entry, sl, math.Abs(entry-sl), p.MaxSLPoints)
 	}
 	// Spread bake-in: long pays the spread on entry, short receives it.
 	if cs.Side == core.Long {
@@ -345,7 +350,7 @@ func acceptSignal(candles []core.Candle, i int, cs meta.CompositeSignal, p engin
 		Entry:     entry,
 		SL:        sl,
 		TP:        tp,
-	}, true
+	}, true, ""
 }
 
 // gradeOne walks the candles AFTER pos.EntryTime looking for the first
