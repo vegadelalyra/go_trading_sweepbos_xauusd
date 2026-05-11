@@ -1,13 +1,18 @@
 package main
 
-// Transitional aliases that let `package main` keep using bare names
-// (Candle, Side, Long, classifySession…) while the canonical definitions
-// have moved into internal subpackages. Files that get migrated into the
-// new packages (e.g. internal/strategy/smc) use the qualified names
-// directly; everything still in main goes through this file.
+// Bare-name aliases for the types and helpers that internal subpackages own.
+// `package main` (engine, meta, wfa, cli, tui, report, db) keeps using these
+// short names so the diff against the pre-refactor codebase stays small. The
+// canonical definitions live in:
 //
-// Delete this file once main no longer holds any code that needs these
-// bare names — that closes the refactor.
+//   core      — Candle, Side, Signal, Trade, session helpers
+//   smc       — Analysis (the SMC primitives output)
+//   indicator — ATRAt (the only indicator main still calls directly)
+//   bias      — BiasMap, BuildBiasMap
+//
+// Every strategy now lives in internal/strategy/{smc,ta,xasset} and reaches
+// for these packages by their canonical paths — they do NOT depend on this
+// file.
 
 import (
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/bias"
@@ -17,19 +22,12 @@ import (
 )
 
 type (
-	Candle = core.Candle
-	Side   = core.Side
-	Signal = core.Signal
-	Trade  = core.Trade
-
-	Swing          = smc.Swing
-	FVG            = smc.FVG
-	StructureKind  = smc.StructureKind
-	StructureEvent = smc.StructureEvent
-	OrderBlock     = smc.OrderBlock
-	Analysis       = smc.Analysis
-
-	BiasMap = bias.BiasMap
+	Candle   = core.Candle
+	Side     = core.Side
+	Signal   = core.Signal
+	Trade    = core.Trade
+	Analysis = smc.Analysis
+	BiasMap  = bias.BiasMap
 )
 
 const (
@@ -41,34 +39,15 @@ const (
 	SessionNYAM   = core.SessionNYAM
 	SessionNYPM   = core.SessionNYPM
 	SessionOff    = core.SessionOff
-
-	StructNone      = smc.StructNone
-	StructBOSBull   = smc.StructBOSBull
-	StructBOSBear   = smc.StructBOSBear
-	StructCHoChBull = smc.StructCHoChBull
-	StructCHoChBear = smc.StructCHoChBear
 )
 
 var (
-	nyLoc             = core.NyLoc
 	toNY              = core.ToNY
 	classifySession   = core.ClassifySession
 	yearMonthBucket   = core.YearMonthBucket
 	yearQuarterBucket = core.YearQuarterBucket
 
-	Analyze           = smc.Analyze
-	DetectSwings      = smc.DetectSwings
-	DetectFVGs        = smc.DetectFVGs
-	DetectStructure   = smc.DetectStructure
-	DetectOrderBlocks = smc.DetectOrderBlocks
-
-	ATR            = indicator.ATR
-	ATRAt          = indicator.ATRAt
-	TrueRange      = indicator.TrueRange
-	TrueRangeFirst = indicator.TrueRangeFirst
-	EMA            = indicator.EMA
-	RSI            = indicator.RSI
-	Bollinger      = indicator.Bollinger
-
+	Analyze      = smc.Analyze
+	ATRAt        = indicator.ATRAt
 	BuildBiasMap = bias.BuildBiasMap
 )

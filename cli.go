@@ -13,6 +13,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/joho/godotenv"
 
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy/xasset"
 )
 
@@ -278,7 +279,7 @@ func runBacktestCLI(args []string) int {
 			fmt.Printf("XAG candles loaded (%d 1h bars) — XAUXAGPairs active\n", len(xag))
 		}
 	}
-	result := RunBacktest(candles, Strategies, params)
+	result := RunBacktest(candles, strategy.All(), params)
 	printBacktestReport(*symbol, *interval, result)
 
 	if *persist {

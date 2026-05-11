@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy"
 )
 
 // StrategyWeight summarises a strategy's historical edge in a single number.
@@ -103,8 +105,8 @@ type TaggedSignal struct {
 func ComposeSignal(candles []Candle, a Analysis, i int, weights map[string]float64, threshold float64) CompositeSignal {
 	cs := CompositeSignal{}
 	var bestLong, bestShort *TaggedSignal
-	for _, strat := range Strategies {
-		sig, ok := strat(candles, a, i)
+	for _, s := range strategy.All() {
+		sig, ok := s.Detect(candles, a, i)
 		if !ok {
 			continue
 		}

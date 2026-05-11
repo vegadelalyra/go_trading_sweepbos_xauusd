@@ -14,6 +14,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy"
 )
 
 const (
@@ -158,7 +160,7 @@ func loadBacktestDataCmd(pool *pgxpool.Pool) tea.Cmd {
 
 func runBacktestCmd(candles []Candle) tea.Cmd {
 	return func() tea.Msg {
-		r := RunBacktest(candles, Strategies, DefaultParams())
+		r := RunBacktest(candles, strategy.All(), DefaultParams())
 		return backtestMsg{result: r}
 	}
 }

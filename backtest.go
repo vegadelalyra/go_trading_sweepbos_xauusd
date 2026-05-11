@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"math"
+
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy"
 )
 
 type BacktestParams struct {
@@ -92,7 +94,11 @@ type BacktestResult struct {
 	Params BacktestParams
 }
 
-func RunBacktest(candles []Candle, strategies []StrategyFn, p BacktestParams) BacktestResult {
+// RunBacktest evaluates `strategies` against `candles` using the supplied
+// BacktestParams. Pass strategy.All() to use every registered strategy
+// (production case); pass a curated subset to test a single strategy in
+// isolation. Order matters — the engine fires the first match per candle.
+func RunBacktest(candles []Candle, strategies []strategy.Strategy, p BacktestParams) BacktestResult {
 	a := Analyze(candles)
 
 	balance := p.StartBalance
@@ -198,8 +204,8 @@ func RunBacktest(candles []Candle, strategies []StrategyFn, p BacktestParams) Ba
 			continue
 		}
 
-		for _, strat := range strategies {
-			sig, ok := strat(candles, a, i)
+		for _, s := range strategies {
+			sig, ok := s.Detect(candles, a, i)
 			if !ok {
 				continue
 			}
@@ -229,9 +235,9 @@ func RunBacktest(candles []Candle, strategies []StrategyFn, p BacktestParams) Ba
 						}
 						// Recompute TP to keep fixed RR.
 						if sig.Side == Long {
-							sig.TP = sig.Entry + atrD*fixedRR
+							sig.TP = sig.Entry + atrD*strategy.DefaultRR
 						} else {
-							sig.TP = sig.Entry - atrD*fixedRR
+							sig.TP = sig.Entry - atrD*strategy.DefaultRR
 						}
 					}
 				}

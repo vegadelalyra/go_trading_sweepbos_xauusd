@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy"
 )
 
 // WFAConfig parametrises a single walk-forward analysis run.
@@ -102,7 +104,7 @@ func RunWFA(ctx context.Context, pool *pgxpool.Pool, cfg WFAConfig) (WFAResult, 
 			params.ATRPeriod = 14
 		}
 
-		isResult := RunBacktest(isCandles, Strategies, params)
+		isResult := RunBacktest(isCandles, strategy.All(), params)
 		weightsList := computeWeights(isResult.Trades)
 		weights := make(map[string]float64, len(weightsList))
 		for _, w := range weightsList {
@@ -297,10 +299,10 @@ func simulateOOS(candles []Candle, p BacktestParams, weights map[string]float64,
 				if atrD > structuralD {
 					if cs.Side == Long {
 						sl = entry - atrD
-						tp = entry + atrD*fixedRR
+						tp = entry + atrD*strategy.DefaultRR
 					} else {
 						sl = entry + atrD
-						tp = entry - atrD*fixedRR
+						tp = entry - atrD*strategy.DefaultRR
 					}
 				}
 			}
