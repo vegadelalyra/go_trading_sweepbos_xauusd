@@ -124,7 +124,10 @@ func RunWFA(cfg WFAConfig, candles []core.Candle, h4Candles []core.Candle) (WFAR
 			weights[w.Strategy] = w.Weight
 		}
 
-		oosTrades := simulateOOS(oosCandles, params, weights, cfg.Threshold)
+		compose := func(c []core.Candle, a smc.Analysis, idx int) meta.CompositeSignal {
+			return meta.ComposeSignal(c, a, idx, weights, cfg.Threshold)
+		}
+		oosTrades := SimulateOOS(oosCandles, params, compose)
 
 		win := WFAWindow{
 			ISStart:   isStart,
@@ -204,13 +207,23 @@ func computeWeights(trades []core.Trade) []meta.StrategyWeight {
 	return out
 }
 
-// simulateOOS replays a candle slice using the composite-signal gate. Unlike
+// Composer turns a candle index into the composite vote that decides whether
+// to open a trade. Callers parameterise this so the same replay machinery
+// drives WFA OOS (flat weights, ComposeSignal) and paper-trading (fixed or
+// per-session weights, possibly from a different run). The function MUST be
+// pure with respect to the slice — SimulateOOS calls it on every bar and
+// relies on identical inputs producing identical outputs.
+type Composer func(candles []core.Candle, a smc.Analysis, i int) meta.CompositeSignal
+
+// SimulateOOS replays a candle slice using a composite-signal gate. Unlike
 // engine.RunBacktest (which fires the first matching strategy per candle),
-// here every strategy votes and only the weighted majority — already known
-// from the IS window — produces an entry. The lifecycle
-// (SL/TP/time-stop/spread/ATR/SL guard) matches RunBacktest exactly so OOS
-// realism is preserved.
-func simulateOOS(candles []core.Candle, p engine.BacktestParams, weights map[string]float64, threshold float64) []core.Trade {
+// here every strategy votes through `compose` and only the weighted majority
+// produces an entry. The lifecycle (SL/TP/time-stop/spread/ATR/SL guard)
+// matches RunBacktest exactly so OOS realism is preserved. Trades are tagged
+// with `cs.WinnerStrategy` (the strategy whose levels were taken) so weight
+// aggregation downstream credits the actual contributor, not a generic
+// "Composite" sink.
+func SimulateOOS(candles []core.Candle, p engine.BacktestParams, compose Composer) []core.Trade {
 	a := smc.Analyze(candles)
 	balance := p.StartBalance
 	dayStart := balance
@@ -320,7 +333,7 @@ func simulateOOS(candles []core.Candle, p engine.BacktestParams, weights map[str
 			continue
 		}
 
-		cs := meta.ComposeSignal(candles, a, i, weights, threshold)
+		cs := compose(candles, a, i)
 		if !cs.Recommended {
 			continue
 		}
@@ -371,8 +384,16 @@ func simulateOOS(candles []core.Candle, p engine.BacktestParams, weights map[str
 		} else {
 			entry -= p.SpreadDollar
 		}
+		// Attribute the trade to the winning strategy whose levels were taken,
+		// not to a generic "Composite" sink. Falls back to "Composite" only
+		// in the defensive case where the composer somehow recommends without
+		// nominating a winner (shouldn't happen given current ComposeSignal).
+		strat := cs.WinnerStrategy
+		if strat == "" {
+			strat = "Composite"
+		}
 		open = &core.Trade{
-			Strategy:  "Composite",
+			Strategy:  strat,
 			Side:      cs.Side,
 			EntryIdx:  i,
 			EntryTime: c.Time,

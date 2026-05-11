@@ -254,6 +254,13 @@ type CompositeSignal struct {
 	BestEntry   float64
 	BestSL      float64
 	BestTP      float64
+	// WinnerStrategy names the strategy whose Entry/SL/TP were chosen — i.e.
+	// the highest-weighted contributor on the winning side. Empty when
+	// Recommended is false. Critical for attribution: composite trades that
+	// hit are credited back to the actual strategy that supplied the levels,
+	// so meta.LoadWeights aggregates real per-strategy edges rather than
+	// lumping every composite-mediated trade under a single "Composite" key.
+	WinnerStrategy string
 }
 
 // TaggedSignal pairs a raw strategy signal with the weight that strategy
@@ -306,12 +313,14 @@ func ComposeSignal(candles []core.Candle, a smc.Analysis, i int, weights map[str
 		cs.BestEntry = bestLong.Signal.Entry
 		cs.BestSL = bestLong.Signal.SL
 		cs.BestTP = bestLong.Signal.TP
+		cs.WinnerStrategy = bestLong.Signal.Strategy
 	} else if -cs.NetWeight >= threshold && bestShort != nil {
 		cs.Side = core.Short
 		cs.Recommended = true
 		cs.BestEntry = bestShort.Signal.Entry
 		cs.BestSL = bestShort.Signal.SL
 		cs.BestTP = bestShort.Signal.TP
+		cs.WinnerStrategy = bestShort.Signal.Strategy
 	}
 	return cs
 }
@@ -364,12 +373,14 @@ func ComposeSignalBySession(candles []core.Candle, a smc.Analysis, i int, weight
 		cs.BestEntry = bestLong.Signal.Entry
 		cs.BestSL = bestLong.Signal.SL
 		cs.BestTP = bestLong.Signal.TP
+		cs.WinnerStrategy = bestLong.Signal.Strategy
 	} else if -cs.NetWeight >= threshold && bestShort != nil {
 		cs.Side = core.Short
 		cs.Recommended = true
 		cs.BestEntry = bestShort.Signal.Entry
 		cs.BestSL = bestShort.Signal.SL
 		cs.BestTP = bestShort.Signal.TP
+		cs.WinnerStrategy = bestShort.Signal.Strategy
 	}
 	return cs
 }

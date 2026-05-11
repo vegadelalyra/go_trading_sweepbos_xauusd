@@ -18,6 +18,7 @@ import (
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/core"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/engine"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/meta"
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/paper"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/smc"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy/xasset"
@@ -49,6 +50,8 @@ func run(args []string) int {
 		return runWFA(args[2:])
 	case "bootstrap":
 		return runBootstrap(args[2:])
+	case "paper-replay":
+		return runPaperReplay(args[2:])
 	case "live-signal":
 		return runLiveSignal(args[2:])
 	case "import-cache":
@@ -78,6 +81,7 @@ SUBCOMMANDS
   weights       print the per-strategy weights derived from a past run
   wfa           walk-forward analysis: rolling IS→OOS windows
   bootstrap     stationary block bootstrap CIs over a stored run's trades
+  paper-replay  replay composite signals over historical candles with FIXED weights and persist results
   live-signal   stream live ticks (TD WSS) and recompose the signal on REST polls
   import-cache  one-shot import of the legacy JSON cache into Postgres
 
@@ -629,6 +633,153 @@ func runBootstrap(args []string) int {
 	br := StationaryBlockBootstrap(trades, *iterations, *blockLen, startBal, riskPct)
 	fmt.Printf("\n═══ %s ═══\n", header)
 	fmt.Print(formatBootstrap(br, len(trades)))
+	return 0
+}
+
+func runPaperReplay(args []string) int {
+	fs := flag.NewFlagSet("paper-replay", flag.ContinueOnError)
+	runID := fs.Int64("run-id", 0, "backtest_runs.id whose weights drive the replay (0 = latest)")
+	symbol := fs.String("symbol", "XAU/USD", "symbol")
+	interval := fs.String("interval", "15m", "interval to replay")
+	fromStr := fs.String("from", "", "lower bound (YYYY-MM-DD); empty = full history")
+	toStr := fs.String("to", "", "upper bound (YYYY-MM-DD); empty = up to now")
+	threshold := fs.Float64("threshold", 2.0, "composite |NetWeight| threshold for an entry")
+	useBias := fs.Bool("bias", false, "apply H4 EMA bias filter")
+	atrMult := fs.Float64("atr-mult", 0, "ATR SL widening multiplier (0 disables)")
+	h4Period := fs.Int("h4-period", 200, "EMA period for the H4 bias")
+	pdLookback := fs.Int("pd-lookback", 96, "Premium/Discount filter lookback in candles (0 disables, 96 = 24h on 15m)")
+	slippage := fs.Float64("slippage", 0, "SL slippage in dollars (0 disables)")
+	slippageNewsMult := fs.Float64("slippage-news-mult", 1.0, "multiplier applied to slippage in news windows")
+	bySession := fs.Bool("by-session", false, "use per-session weight table instead of the global one")
+	persist := fs.Bool("persist", false, "store this paper run + every trade in paper_runs/paper_trades")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	ctx := context.Background()
+	pool, err := openPool(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "db: %v\n", err)
+		return 1
+	}
+	defer pool.Close()
+
+	id := *runID
+	if id == 0 {
+		if err := pool.QueryRow(ctx, `SELECT id FROM backtest_runs ORDER BY id DESC LIMIT 1`).Scan(&id); err != nil {
+			fmt.Fprintf(os.Stderr, "find latest backtest run: %v\n", err)
+			return 1
+		}
+	}
+
+	var from, to time.Time
+	if *fromStr != "" {
+		t, err := time.Parse("2006-01-02", *fromStr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "from: %v\n", err)
+			return 2
+		}
+		from = t
+	}
+	if *toStr != "" {
+		t, err := time.Parse("2006-01-02", *toStr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "to: %v\n", err)
+			return 2
+		}
+		to = t.Add(24 * time.Hour)
+	}
+
+	candles, err := loadCandles(ctx, pool, *symbol, *interval, from, to)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load candles: %v\n", err)
+		return 1
+	}
+	if len(candles) < 200 {
+		fmt.Fprintf(os.Stderr, "only %d candles loaded — widen the range or backfill\n", len(candles))
+		return 1
+	}
+	var h4Candles []core.Candle
+	if *useBias {
+		h4Candles, err = loadCandles(ctx, pool, *symbol, "4h", from, to)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load h4: %v\n", err)
+			return 1
+		}
+	}
+
+	cfg := paper.Config{
+		SourceRunID: id, BySession: *bySession,
+		Symbol: *symbol, Interval: *interval,
+		StartDate: from, EndDate: to,
+		Threshold: *threshold, UseBias: *useBias, ATRMult: *atrMult, H4Period: *h4Period,
+		PDLookback:       *pdLookback,
+		Slippage:         *slippage,
+		SlippageNewsMult: *slippageNewsMult,
+	}
+
+	var (
+		flat       map[string]float64
+		bySessTbl  map[string]map[string]float64
+	)
+	if *bySession {
+		bySessTbl, err = meta.LoadWeightsBySession(ctx, pool, id)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load weights-by-session: %v\n", err)
+			return 1
+		}
+	} else {
+		ws, err := meta.LoadWeights(ctx, pool, id)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load weights: %v\n", err)
+			return 1
+		}
+		flat = meta.WeightMap(ws)
+	}
+
+	res := paper.Replay(cfg, candles, h4Candles, flat, bySessTbl)
+
+	fmt.Printf("\n═══ Paper Replay — %s %s ═══\n", *symbol, *interval)
+	fmt.Printf("  Source: backtest_runs.id=%d  ·  bySession=%t  ·  threshold=%.2f  ·  bias=%t  ·  atrMult=%.2f\n",
+		id, *bySession, *threshold, *useBias, *atrMult)
+	fmt.Printf("  Range: %s → %s  (%d candles)\n\n",
+		candles[0].Time.Format("2006-01-02 15:04"),
+		candles[len(candles)-1].Time.Format("2006-01-02 15:04"),
+		len(candles))
+	s := res.Stats
+	if s.Total == 0 {
+		fmt.Println("  No trades — threshold too high, weights too sparse, or filters blocked everything.")
+		return 0
+	}
+	pf := fmt.Sprintf("%.2f", s.ProfitFactor)
+	if math.IsInf(s.ProfitFactor, 1) {
+		pf = "∞"
+	}
+	fmt.Printf("  Trades=%d  WR=%.1f%%  NetR=%+.2f  PF=%s  MaxDD=%.1f%%  Sharpe=%.2f  Calmar=%.2f\n",
+		s.Total, s.WinRate*100, s.NetR, pf, s.MaxDDPct*100, s.Sharpe, s.Calmar)
+	fmt.Printf("  Balance: $%.0f → $%.0f (%+.2f%%)\n",
+		s.StartBalance, s.EndBalance, (s.EndBalance-s.StartBalance)/s.StartBalance*100)
+
+	// Per-strategy breakdown of who actually got credit — the attribution
+	// to the WinnerStrategy lets us see which strategies are pulling weight
+	// in the live regime, which is the input the weight-feedback step
+	// (commit 2) will consume.
+	fmt.Println("\n── Per Winner Strategy ─────────────────────────────────────")
+	for _, name := range sortedKeys(s.PerStrategy) {
+		ps := s.PerStrategy[name]
+		fmt.Printf("  %-18s  Trades=%d  Win=%d/Loss=%d  WR=%5.1f%%  NetR=%+7.2f\n",
+			name, ps.Total, ps.Wins, ps.Losses, ps.WinRate*100, ps.NetR)
+	}
+
+	if *persist {
+		paperID, err := paper.SaveRun(ctx, pool, cfg,
+			res, candles[0].Time, candles[len(candles)-1].Time)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "persist: %v\n", err)
+			return 1
+		}
+		fmt.Printf("\nPersisted as paper_runs.id=%d with %d trades\n", paperID, len(res.Trades))
+	}
 	return 0
 }
 
