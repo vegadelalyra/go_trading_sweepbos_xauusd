@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/engine"
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/meta"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/metrics"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/smc"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy"
@@ -156,15 +157,15 @@ func sliceByTime(candles []Candle, from, to time.Time) []Candle {
 }
 
 // computeWeights derives StrategyWeights from an in-memory trades slice.
-// Mirrors the SQL aggregation in LoadWeights so WFA windows don't need to
-// persist their IS run to Postgres. Uses the same sharpeWeight helper as
-// LoadWeights — drift between the two would silently bias WFA results.
-func computeWeights(trades []Trade) []StrategyWeight {
+// Mirrors the SQL aggregation in meta.LoadWeights so WFA windows don't need
+// to persist their IS run to Postgres. Uses the same meta.SharpeWeight helper
+// as LoadWeights — drift between the two would silently bias WFA results.
+func computeWeights(trades []Trade) []meta.StrategyWeight {
 	byStrat := map[string][]Trade{}
 	for _, t := range trades {
 		byStrat[t.Strategy] = append(byStrat[t.Strategy], t)
 	}
-	out := make([]StrategyWeight, 0, len(byStrat))
+	out := make([]meta.StrategyWeight, 0, len(byStrat))
 	for name, ts := range byStrat {
 		n := len(ts)
 		exp := 0.0
@@ -188,14 +189,14 @@ func computeWeights(trades []Trade) []StrategyWeight {
 		}
 		stddev := math.Sqrt(sq / float64(n))
 
-		out = append(out, StrategyWeight{
+		out = append(out, meta.StrategyWeight{
 			Strategy:   name,
 			Trades:     n,
 			Expectancy: exp,
 			StdDev:     stddev,
 			WinRate:    float64(wins) / float64(n),
 			NetR:       netR,
-			Weight:     sharpeWeight(exp, stddev, n),
+			Weight:     meta.SharpeWeight(exp, stddev, n),
 		})
 	}
 	return out
@@ -316,7 +317,7 @@ func simulateOOS(candles []Candle, p engine.BacktestParams, weights map[string]f
 			continue
 		}
 
-		cs := ComposeSignal(candles, a, i, weights, threshold)
+		cs := meta.ComposeSignal(candles, a, i, weights, threshold)
 		if !cs.Recommended {
 			continue
 		}

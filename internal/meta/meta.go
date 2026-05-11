@@ -1,4 +1,10 @@
-package main
+// Package meta owns the meta-strategy layer: per-strategy weights
+// derived from a stored backtest run, the variance-aware Sharpe weight
+// formula, alpha-decay detection, and the composite-vote engine that
+// turns every strategy's signal on a given candle into a single
+// recommended entry. It depends on core (Candle/Side/Trade), smc
+// (Analysis) and the strategy catalog — never on engine, wfa, cli or db.
+package meta
 
 import (
 	"context"
@@ -9,6 +15,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/core"
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/smc"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy"
 )
 
@@ -16,11 +24,11 @@ import (
 //
 // Formula:  weight = max(0, expectancy_R / stddev_R) * log(trades + 1)
 //
-//   • Numerator is a per-trade Sharpe analogue — expectancy normalised by
+//   - Numerator is a per-trade Sharpe analogue — expectancy normalised by
 //     realised dispersion. Two strategies with the same expectancy but one
 //     with 10× the variance receive very different weights.
-//   • Negative expectancy → ratio <= 0 → weight 0, the strategy doesn't vote.
-//   • log(N+1) compresses the bonus given to hyperactive over-traders. The
+//   - Negative expectancy → ratio <= 0 → weight 0, the strategy doesn't vote.
+//   - log(N+1) compresses the bonus given to hyperactive over-traders. The
 //     previous sqrt(N) let a 1000-trade strategy carry 30× more weight than
 //     a 1-trade one even when the per-trade quality was identical; log
 //     dampens that to ~7×.
@@ -66,7 +74,7 @@ func LoadWeights(ctx context.Context, pool *pgxpool.Pool, runID int64) ([]Strate
 		if err := rows.Scan(&sw.Strategy, &sw.Trades, &sw.Expectancy, &sw.StdDev, &sw.WinRate, &sw.NetR); err != nil {
 			return nil, err
 		}
-		sw.Weight = sharpeWeight(sw.Expectancy, sw.StdDev, sw.Trades)
+		sw.Weight = SharpeWeight(sw.Expectancy, sw.StdDev, sw.Trades)
 		out = append(out, sw)
 	}
 	if err := rows.Err(); err != nil {
@@ -88,10 +96,10 @@ func LoadWeights(ctx context.Context, pool *pgxpool.Pool, runID int64) ([]Strate
 	return out, nil
 }
 
-// sharpeWeight implements the variance-aware weight formula used by both
-// LoadWeights (SQL aggregation) and walkforward.go's in-memory equivalent.
+// SharpeWeight implements the variance-aware weight formula used by both
+// LoadWeights (SQL aggregation) and wfa's in-memory equivalent.
 // Single source of truth — drift between the two would silently bias WFA.
-func sharpeWeight(expectancy, stddev float64, trades int) float64 {
+func SharpeWeight(expectancy, stddev float64, trades int) float64 {
 	if stddev <= 1e-9 || expectancy <= 0 || trades <= 0 {
 		return 0
 	}
@@ -143,7 +151,7 @@ func LoadWeightsBySession(ctx context.Context, pool *pgxpool.Pool, runID int64) 
 		if err := rows.Scan(&strat, &sess, &trades, &exp, &stddev); err != nil {
 			return nil, err
 		}
-		w := sharpeWeight(exp, stddev, trades)
+		w := SharpeWeight(exp, stddev, trades)
 		if w <= 0 {
 			continue
 		}
@@ -236,12 +244,12 @@ func DetectAlphaDecay(ctx context.Context, pool *pgxpool.Pool, runID int64, wind
 // CompositeSignal is the meta-strategy's verdict for one candle. It always
 // reports both sides' weights so the caller sees how decisive the vote was.
 type CompositeSignal struct {
-	Side        Side    // chosen direction if Recommended
-	LongWeight  float64 // sum of weights of strategies that flagged LONG
-	ShortWeight float64 // ditto for SHORT
-	NetWeight   float64 // LongWeight − ShortWeight
-	Confidence  float64 // |NetWeight| / (LongWeight + ShortWeight); 0..1
-	Recommended bool    // true if |NetWeight| crosses threshold
+	Side        core.Side // chosen direction if Recommended
+	LongWeight  float64   // sum of weights of strategies that flagged LONG
+	ShortWeight float64   // ditto for SHORT
+	NetWeight   float64   // LongWeight − ShortWeight
+	Confidence  float64   // |NetWeight| / (LongWeight + ShortWeight); 0..1
+	Recommended bool      // true if |NetWeight| crosses threshold
 	Triggers    []TaggedSignal
 	BestEntry   float64
 	BestSL      float64
@@ -251,7 +259,7 @@ type CompositeSignal struct {
 // TaggedSignal pairs a raw strategy signal with the weight that strategy
 // carries in this composite vote — useful for debugging which voices won.
 type TaggedSignal struct {
-	Signal Signal
+	Signal core.Signal
 	Weight float64
 }
 
@@ -260,7 +268,7 @@ type TaggedSignal struct {
 // threshold, it picks the direction and surfaces the best (highest-weight)
 // individual entry/SL/TP triplet from the winning side as the recommended
 // execution levels.
-func ComposeSignal(candles []Candle, a Analysis, i int, weights map[string]float64, threshold float64) CompositeSignal {
+func ComposeSignal(candles []core.Candle, a smc.Analysis, i int, weights map[string]float64, threshold float64) CompositeSignal {
 	cs := CompositeSignal{}
 	var bestLong, bestShort *TaggedSignal
 	for _, s := range strategy.All() {
@@ -274,7 +282,7 @@ func ComposeSignal(candles []Candle, a Analysis, i int, weights map[string]float
 		}
 		ts := TaggedSignal{Signal: sig, Weight: w}
 		cs.Triggers = append(cs.Triggers, ts)
-		if sig.Side == Long {
+		if sig.Side == core.Long {
 			cs.LongWeight += w
 			if bestLong == nil || w > bestLong.Weight {
 				bestLong = &ts
@@ -293,13 +301,13 @@ func ComposeSignal(candles []Candle, a Analysis, i int, weights map[string]float
 	}
 
 	if cs.NetWeight >= threshold && bestLong != nil {
-		cs.Side = Long
+		cs.Side = core.Long
 		cs.Recommended = true
 		cs.BestEntry = bestLong.Signal.Entry
 		cs.BestSL = bestLong.Signal.SL
 		cs.BestTP = bestLong.Signal.TP
 	} else if -cs.NetWeight >= threshold && bestShort != nil {
-		cs.Side = Short
+		cs.Side = core.Short
 		cs.Recommended = true
 		cs.BestEntry = bestShort.Signal.Entry
 		cs.BestSL = bestShort.Signal.SL
@@ -315,10 +323,10 @@ func ComposeSignal(candles []Candle, a Analysis, i int, weights map[string]float
 //
 // Same threshold and best-entry tie-break as ComposeSignal; only the weight
 // lookup differs.
-func ComposeSignalBySession(candles []Candle, a Analysis, i int, weightsBySession map[string]map[string]float64, threshold float64) CompositeSignal {
+func ComposeSignalBySession(candles []core.Candle, a smc.Analysis, i int, weightsBySession map[string]map[string]float64, threshold float64) CompositeSignal {
 	cs := CompositeSignal{}
 	var bestLong, bestShort *TaggedSignal
-	sess := classifySession(candles[i].Time)
+	sess := core.ClassifySession(candles[i].Time)
 	for _, s := range strategy.All() {
 		sig, ok := s.Detect(candles, a, i)
 		if !ok {
@@ -333,7 +341,7 @@ func ComposeSignalBySession(candles []Candle, a Analysis, i int, weightsBySessio
 		}
 		ts := TaggedSignal{Signal: sig, Weight: w}
 		cs.Triggers = append(cs.Triggers, ts)
-		if sig.Side == Long {
+		if sig.Side == core.Long {
 			cs.LongWeight += w
 			if bestLong == nil || w > bestLong.Weight {
 				bestLong = &ts
@@ -351,13 +359,13 @@ func ComposeSignalBySession(candles []Candle, a Analysis, i int, weightsBySessio
 		cs.Confidence = math.Abs(cs.NetWeight) / total
 	}
 	if cs.NetWeight >= threshold && bestLong != nil {
-		cs.Side = Long
+		cs.Side = core.Long
 		cs.Recommended = true
 		cs.BestEntry = bestLong.Signal.Entry
 		cs.BestSL = bestLong.Signal.SL
 		cs.BestTP = bestLong.Signal.TP
 	} else if -cs.NetWeight >= threshold && bestShort != nil {
-		cs.Side = Short
+		cs.Side = core.Short
 		cs.Recommended = true
 		cs.BestEntry = bestShort.Signal.Entry
 		cs.BestSL = bestShort.Signal.SL
@@ -366,10 +374,10 @@ func ComposeSignalBySession(candles []Candle, a Analysis, i int, weightsBySessio
 	return cs
 }
 
-// printCompositeSignal writes a CLI-friendly report of the meta-strategy
+// PrintCompositeSignal writes a CLI-friendly report of the meta-strategy
 // verdict for a single candle. If capital > 0, also computes Admirals
 // position sizing (1 lot = 100 oz, Tier 1 leverage 1:500).
-func printCompositeSignal(symbol, interval string, candle Candle, cs CompositeSignal, runID int64, threshold, capital float64) {
+func PrintCompositeSignal(symbol, interval string, candle core.Candle, cs CompositeSignal, runID int64, threshold, capital float64) {
 	fmt.Printf("\n═══ Composite Signal — %s %s ═══\n", symbol, interval)
 	fmt.Printf("  Run: #%d  ·  Threshold: %.2f  ·  Last candle: %s  ·  Close: $%.2f\n\n",
 		runID, threshold,
@@ -403,7 +411,7 @@ func printCompositeSignal(symbol, interval string, candle Candle, cs CompositeSi
 	}
 
 	emoji := "🟢"
-	if cs.Side == Short {
+	if cs.Side == core.Short {
 		emoji = "🔴"
 	}
 	d := math.Abs(cs.BestEntry - cs.BestSL)

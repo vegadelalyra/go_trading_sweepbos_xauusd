@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/livefeed"
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/meta"
 )
 
 // runLiveSignal implements the `live-signal` subcommand: subscribe to the
@@ -54,25 +55,25 @@ func runLiveSignal(args []string) int {
 	}
 
 	// Resolve composer ONCE — the polled goroutine reuses it on every tick.
-	var compose func(candles []Candle, a Analysis, i int) CompositeSignal
+	var compose func(candles []Candle, a Analysis, i int) meta.CompositeSignal
 	if *bySession {
-		ws, err := LoadWeightsBySession(ctx, pool, id)
+		ws, err := meta.LoadWeightsBySession(ctx, pool, id)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "load weights-by-session: %v\n", err)
 			return 1
 		}
-		compose = func(c []Candle, a Analysis, i int) CompositeSignal {
-			return ComposeSignalBySession(c, a, i, ws, *threshold)
+		compose = func(c []Candle, a Analysis, i int) meta.CompositeSignal {
+			return meta.ComposeSignalBySession(c, a, i, ws, *threshold)
 		}
 	} else {
-		ws, err := LoadWeights(ctx, pool, id)
+		ws, err := meta.LoadWeights(ctx, pool, id)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "load weights: %v\n", err)
 			return 1
 		}
-		wm := WeightMap(ws)
-		compose = func(c []Candle, a Analysis, i int) CompositeSignal {
-			return ComposeSignal(c, a, i, wm, *threshold)
+		wm := meta.WeightMap(ws)
+		compose = func(c []Candle, a Analysis, i int) meta.CompositeSignal {
+			return meta.ComposeSignal(c, a, i, wm, *threshold)
 		}
 	}
 

@@ -14,6 +14,7 @@ import (
 	"github.com/joho/godotenv"
 
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/engine"
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/meta"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy/xasset"
 )
@@ -335,13 +336,13 @@ func runWeights(args []string) int {
 			return 1
 		}
 	}
-	ws, err := LoadWeights(ctx, pool, id)
+	ws, err := meta.LoadWeights(ctx, pool, id)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load weights: %v\n", err)
 		return 1
 	}
 	fmt.Printf("\nWeights derived from backtest_runs.id=%d\n\n", id)
-	fmt.Println(FormatWeights(ws))
+	fmt.Println(meta.FormatWeights(ws))
 	return 0
 }
 
@@ -387,31 +388,31 @@ func runSignal(args []string) int {
 
 	// Two compose modes share the rest of the runSignal loop. compose is
 	// closed over either weights map so the call site stays uniform.
-	var compose func(i int) CompositeSignal
+	var compose func(i int) meta.CompositeSignal
 	if *bySession {
-		ws, err := LoadWeightsBySession(ctx, pool, id)
+		ws, err := meta.LoadWeightsBySession(ctx, pool, id)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "load weights-by-session: %v\n", err)
 			return 1
 		}
-		compose = func(i int) CompositeSignal {
-			return ComposeSignalBySession(candles, a, i, ws, *threshold)
+		compose = func(i int) meta.CompositeSignal {
+			return meta.ComposeSignalBySession(candles, a, i, ws, *threshold)
 		}
 	} else {
-		ws, err := LoadWeights(ctx, pool, id)
+		ws, err := meta.LoadWeights(ctx, pool, id)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "load weights: %v\n", err)
 			return 1
 		}
-		weights := WeightMap(ws)
-		compose = func(i int) CompositeSignal {
-			return ComposeSignal(candles, a, i, weights, *threshold)
+		weights := meta.WeightMap(ws)
+		compose = func(i int) meta.CompositeSignal {
+			return meta.ComposeSignal(candles, a, i, weights, *threshold)
 		}
 	}
 
 	// Always report the current candle.
 	cs := compose(len(candles) - 1)
-	printCompositeSignal(*symbol, *interval, candles[len(candles)-1], cs, id, *threshold, *capital)
+	meta.PrintCompositeSignal(*symbol, *interval, candles[len(candles)-1], cs, id, *threshold, *capital)
 
 	// Optional: walk back N candles looking for the most recent
 	// recommended (threshold-crossing) signal — useful when "now" is quiet.
