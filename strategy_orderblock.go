@@ -63,6 +63,39 @@ func OrderBlockMitigation(candles []Candle, a Analysis, i int) (Signal, bool) {
 		}
 
 		bull := ob.Bullish
+
+		// Inducement: between the OB and now there must be a sub-swing whose own
+		// liquidity was swept — institutional stop-runs prime the retrace into the
+		// OB. Without an inducement, the touch is more likely a continuation than
+		// a mitigation, and OrderBlockMit gets chopped up. We scan for any local
+		// 3-bar extreme between (ob.Index, i) and then confirm a later bar within
+		// the same window took it out.
+		inducement := false
+		for m := ob.Index + 1; m < i && !inducement; m++ {
+			if m-1 < 0 || m+1 >= len(candles) {
+				continue
+			}
+			if bull && candles[m].Low < candles[m-1].Low && candles[m].Low < candles[m+1].Low {
+				for n := m + 1; n < i; n++ {
+					if candles[n].Low < candles[m].Low {
+						inducement = true
+						break
+					}
+				}
+			}
+			if !bull && candles[m].High > candles[m-1].High && candles[m].High > candles[m+1].High {
+				for n := m + 1; n < i; n++ {
+					if candles[n].High > candles[m].High {
+						inducement = true
+						break
+					}
+				}
+			}
+		}
+		if !inducement {
+			continue
+		}
+
 		entry := mid
 		var sl float64
 		if bull {
