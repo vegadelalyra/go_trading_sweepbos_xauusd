@@ -10,7 +10,9 @@ package main
 // bare names — that closes the refactor.
 
 import (
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/bias"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/core"
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/indicator"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/smc"
 )
 
@@ -26,6 +28,8 @@ type (
 	StructureEvent = smc.StructureEvent
 	OrderBlock     = smc.OrderBlock
 	Analysis       = smc.Analysis
+
+	BiasMap = bias.BiasMap
 )
 
 const (
@@ -38,9 +42,9 @@ const (
 	SessionNYPM   = core.SessionNYPM
 	SessionOff    = core.SessionOff
 
-	StructNone     = smc.StructNone
-	StructBOSBull  = smc.StructBOSBull
-	StructBOSBear  = smc.StructBOSBear
+	StructNone      = smc.StructNone
+	StructBOSBull   = smc.StructBOSBull
+	StructBOSBear   = smc.StructBOSBear
 	StructCHoChBull = smc.StructCHoChBull
 	StructCHoChBear = smc.StructCHoChBear
 )
@@ -52,9 +56,19 @@ var (
 	yearMonthBucket   = core.YearMonthBucket
 	yearQuarterBucket = core.YearQuarterBucket
 
-	Analyze             = smc.Analyze
-	DetectSwings        = smc.DetectSwings
-	DetectFVGs          = smc.DetectFVGs
-	DetectStructure     = smc.DetectStructure
-	DetectOrderBlocks   = smc.DetectOrderBlocks
+	Analyze           = smc.Analyze
+	DetectSwings      = smc.DetectSwings
+	DetectFVGs        = smc.DetectFVGs
+	DetectStructure   = smc.DetectStructure
+	DetectOrderBlocks = smc.DetectOrderBlocks
+
+	ATR            = indicator.ATR
+	ATRAt          = indicator.ATRAt
+	TrueRange      = indicator.TrueRange
+	TrueRangeFirst = indicator.TrueRangeFirst
+	EMA            = indicator.EMA
+	RSI            = indicator.RSI
+	Bollinger      = indicator.Bollinger
+
+	BuildBiasMap = bias.BuildBiasMap
 )
