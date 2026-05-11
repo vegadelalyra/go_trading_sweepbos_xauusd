@@ -42,6 +42,8 @@ func run(args []string) int {
 		return runWFA(args[2:])
 	case "bootstrap":
 		return runBootstrap(args[2:])
+	case "live-signal":
+		return runLiveSignal(args[2:])
 	case "import-cache":
 		return runImportCache(args[2:])
 	case "-h", "--help", "help":
@@ -69,6 +71,7 @@ SUBCOMMANDS
   weights       print the per-strategy weights derived from a past run
   wfa           walk-forward analysis: rolling IS→OOS windows
   bootstrap     stationary block bootstrap CIs over a stored run's trades
+  live-signal   stream live ticks (TD WSS) and recompose the signal on REST polls
   import-cache  one-shot import of the legacy JSON cache into Postgres
 
 FLAGS for `+"`backfill`"+`
