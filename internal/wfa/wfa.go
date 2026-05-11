@@ -1,7 +1,18 @@
-package main
+// Package wfa runs walk-forward analyses and persists their results.
+// A WFA rolls IS→OOS windows over a candle slice, derives strategy
+// weights from each window's in-sample backtest, and replays the
+// out-of-sample slice through meta.ComposeSignal — so the model never
+// sees its own evaluation data. The OOS trades from every window are
+// concatenated into the "honest curve" that downstream consumers
+// (bootstrap, reporting) measure.
+//
+// RunWFA takes pre-loaded candle slices so this package never touches
+// the OHLC table — only SaveWFARun talks to Postgres.
+package wfa
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -10,7 +21,10 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/bias"
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/core"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/engine"
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/indicator"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/meta"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/metrics"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/smc"
@@ -21,23 +35,23 @@ import (
 //
 // Time windows roll forward in StepMonths increments. Inside each window
 // we (a) backtest the full strategy set on the IS slice and derive per-strategy
-// weights from those results, then (b) replay the OOS slice using ComposeSignal
-// gated by those weights — the model never sees its own evaluation data. The
-// OOS trades from every window are concatenated to form the "honest curve".
+// weights from those results, then (b) replay the OOS slice using
+// meta.ComposeSignal gated by those weights. The OOS trades from every
+// window are concatenated to form the honest curve.
 type WFAConfig struct {
-	Symbol          string
-	Interval        string
-	ISWindowMonths  int       // in-sample window (weights derive from this)
-	OOSWindowMonths int       // out-of-sample window (evaluation only)
-	StepMonths      int       // gap between successive IS starts
-	StartDate       time.Time // zero = beginning of available data
-	EndDate         time.Time // zero = up to most recent candle
-	Threshold       float64   // |NetWeight| required for an OOS entry
-	UseBias         bool
-	ATRMult         float64
-	H4Period        int
-	PDLookback      int // Premium/Discount filter lookback in candles (0 disables)
-	Slippage        float64
+	Symbol           string
+	Interval         string
+	ISWindowMonths   int       // in-sample window (weights derive from this)
+	OOSWindowMonths  int       // out-of-sample window (evaluation only)
+	StepMonths       int       // gap between successive IS starts
+	StartDate        time.Time // zero = beginning of available data
+	EndDate          time.Time // zero = up to most recent candle
+	Threshold        float64   // |NetWeight| required for an OOS entry
+	UseBias          bool
+	ATRMult          float64
+	H4Period         int
+	PDLookback       int // Premium/Discount filter lookback in candles (0 disables)
+	Slippage         float64
 	SlippageNewsMult float64
 }
 
@@ -46,7 +60,7 @@ type WFAWindow struct {
 	ISStart, ISEnd   time.Time
 	OOSStart, OOSEnd time.Time
 	ISWeights        map[string]float64
-	OOSTrades        []Trade
+	OOSTrades        []core.Trade
 	OOSNetR          float64
 	OOSWinRate       float64
 	OOSSharpe        float64
@@ -55,34 +69,22 @@ type WFAWindow struct {
 // WFAResult is the aggregate of every window run plus the concatenated OOS curve.
 type WFAResult struct {
 	Windows        []WFAWindow
-	CombinedTrades []Trade
+	CombinedTrades []core.Trade
 	CombinedStats  engine.BacktestStats
 	WindowsCount   int
 }
 
-// RunWFA orchestrates the walk-forward analysis end-to-end.
-func RunWFA(ctx context.Context, pool *pgxpool.Pool, cfg WFAConfig) (WFAResult, error) {
-	allCandles, err := loadCandles(ctx, pool, cfg.Symbol, cfg.Interval, cfg.StartDate, cfg.EndDate)
-	if err != nil {
-		return WFAResult{}, fmt.Errorf("load candles: %w", err)
-	}
-	if len(allCandles) < 5000 {
-		return WFAResult{}, fmt.Errorf("need at least 5000 candles for WFA, got %d", len(allCandles))
-	}
-
-	// Pre-load H4 candles once. The per-window slice is taken later so each
-	// window's BiasMap only sees bars up to its own oosEnd.
-	var h4Candles []Candle
-	if cfg.UseBias {
-		h4Candles, err = loadCandles(ctx, pool, cfg.Symbol, "4h", cfg.StartDate, cfg.EndDate)
-		if err != nil {
-			return WFAResult{}, fmt.Errorf("load h4: %w", err)
-		}
+// RunWFA orchestrates the walk-forward analysis end-to-end. Candles must
+// already be sorted ascending by time. h4Candles can be nil when
+// cfg.UseBias is false.
+func RunWFA(cfg WFAConfig, candles []core.Candle, h4Candles []core.Candle) (WFAResult, error) {
+	if len(candles) < 5000 {
+		return WFAResult{}, fmt.Errorf("need at least 5000 candles for WFA, got %d", len(candles))
 	}
 
 	var result WFAResult
-	t0 := allCandles[0].Time
-	tEnd := allCandles[len(allCandles)-1].Time
+	t0 := candles[0].Time
+	tEnd := candles[len(candles)-1].Time
 
 	for cursor := t0; cursor.AddDate(0, cfg.ISWindowMonths+cfg.OOSWindowMonths, 0).Before(tEnd); cursor = cursor.AddDate(0, cfg.StepMonths, 0) {
 		isStart := cursor
@@ -93,11 +95,11 @@ func RunWFA(ctx context.Context, pool *pgxpool.Pool, cfg WFAConfig) (WFAResult, 
 			oosEnd = tEnd
 		}
 
-		isCandles := sliceByTime(allCandles, isStart, isEnd)
+		isCandles := sliceByTime(candles, isStart, isEnd)
 		if len(isCandles) < 500 {
 			continue
 		}
-		oosCandles := sliceByTime(allCandles, oosStart, oosEnd)
+		oosCandles := sliceByTime(candles, oosStart, oosEnd)
 		if len(oosCandles) < 100 {
 			continue
 		}
@@ -105,7 +107,7 @@ func RunWFA(ctx context.Context, pool *pgxpool.Pool, cfg WFAConfig) (WFAResult, 
 		params := engine.ParamsFor(cfg.Interval)
 		if cfg.UseBias && len(h4Candles) > 0 {
 			h4Slice := sliceByTime(h4Candles, isStart, oosEnd)
-			params.H4Bias = BuildBiasMap(h4Slice, cfg.H4Period, 4*time.Hour)
+			params.H4Bias = bias.BuildBiasMap(h4Slice, cfg.H4Period, 4*time.Hour)
 		}
 		if cfg.ATRMult > 0 {
 			params.ATRMult = cfg.ATRMult
@@ -146,8 +148,8 @@ func RunWFA(ctx context.Context, pool *pgxpool.Pool, cfg WFAConfig) (WFAResult, 
 
 // sliceByTime returns the half-open slice [from, to) of a chronologically-sorted
 // candle slice. We binary-search both boundaries; the input must be sorted by
-// Time ascending (loadCandles already does this).
-func sliceByTime(candles []Candle, from, to time.Time) []Candle {
+// Time ascending.
+func sliceByTime(candles []core.Candle, from, to time.Time) []core.Candle {
 	lo := sort.Search(len(candles), func(i int) bool { return !candles[i].Time.Before(from) })
 	hi := sort.Search(len(candles), func(i int) bool { return !candles[i].Time.Before(to) })
 	if lo >= hi {
@@ -158,10 +160,10 @@ func sliceByTime(candles []Candle, from, to time.Time) []Candle {
 
 // computeWeights derives StrategyWeights from an in-memory trades slice.
 // Mirrors the SQL aggregation in meta.LoadWeights so WFA windows don't need
-// to persist their IS run to Postgres. Uses the same meta.SharpeWeight helper
-// as LoadWeights — drift between the two would silently bias WFA results.
-func computeWeights(trades []Trade) []meta.StrategyWeight {
-	byStrat := map[string][]Trade{}
+// to persist their IS run to Postgres. Uses the same meta.SharpeWeight
+// helper as LoadWeights — drift between the two would silently bias WFA.
+func computeWeights(trades []core.Trade) []meta.StrategyWeight {
+	byStrat := map[string][]core.Trade{}
 	for _, t := range trades {
 		byStrat[t.Strategy] = append(byStrat[t.Strategy], t)
 	}
@@ -180,8 +182,8 @@ func computeWeights(trades []Trade) []meta.StrategyWeight {
 		}
 		exp /= float64(n)
 
-		// Population stddev — same convention as SharpeRatio in metrics.go
-		// and STDDEV_POP in the SQL aggregation.
+		// Population stddev — same convention as metrics.SharpeRatio and
+		// STDDEV_POP in the SQL aggregation.
 		sq := 0.0
 		for _, t := range ts {
 			d := t.R - exp
@@ -203,22 +205,23 @@ func computeWeights(trades []Trade) []meta.StrategyWeight {
 }
 
 // simulateOOS replays a candle slice using the composite-signal gate. Unlike
-// RunBacktest (which fires the first matching strategy per candle), here every
-// strategy votes and only the weighted majority — already known from the IS
-// window — produces an entry. The lifecycle (SL/TP/time-stop/spread/ATR/SL guard)
-// matches RunBacktest exactly so OOS realism is preserved.
-func simulateOOS(candles []Candle, p engine.BacktestParams, weights map[string]float64, threshold float64) []Trade {
-	a := Analyze(candles)
+// engine.RunBacktest (which fires the first matching strategy per candle),
+// here every strategy votes and only the weighted majority — already known
+// from the IS window — produces an entry. The lifecycle
+// (SL/TP/time-stop/spread/ATR/SL guard) matches RunBacktest exactly so OOS
+// realism is preserved.
+func simulateOOS(candles []core.Candle, p engine.BacktestParams, weights map[string]float64, threshold float64) []core.Trade {
+	a := smc.Analyze(candles)
 	balance := p.StartBalance
 	dayStart := balance
 	currentDay := -1
-	var trades []Trade
-	var open *Trade
+	var trades []core.Trade
+	var open *core.Trade
 	cooldown := 0
 
 	for i := p.MinIndex; i < len(candles); i++ {
 		c := candles[i]
-		ny := toNY(c.Time)
+		ny := core.ToNY(c.Time)
 		yd := ny.YearDay()
 		if yd != currentDay {
 			currentDay = yd
@@ -229,7 +232,7 @@ func simulateOOS(candles []Candle, p engine.BacktestParams, weights map[string]f
 		if open != nil {
 			closed := false
 			slip := engine.SLPenalty(p, c.Time)
-			if open.Side == Long {
+			if open.Side == core.Long {
 				if c.Low <= open.SL {
 					if slip > 0 {
 						exit := open.SL - slip
@@ -278,7 +281,7 @@ func simulateOOS(candles []Candle, p engine.BacktestParams, weights map[string]f
 			}
 			if !closed && p.MaxHoldCandles > 0 && i-open.EntryIdx >= p.MaxHoldCandles {
 				open.ExitPrice = c.Close
-				if open.Side == Long {
+				if open.Side == core.Long {
 					rd := open.Entry - open.SL
 					if rd > 0 {
 						open.R = (c.Close - open.Entry) / rd
@@ -298,9 +301,9 @@ func simulateOOS(candles []Candle, p engine.BacktestParams, weights map[string]f
 				open.ExitIdx = i
 				open.ExitTime = c.Time
 				open.BalanceAfter = balance
-				open.Session = classifySession(open.EntryTime)
-				open.YearMonth = yearMonthBucket(open.EntryTime)
-				open.YearQuarter = yearQuarterBucket(open.EntryTime)
+				open.Session = core.ClassifySession(open.EntryTime)
+				open.YearMonth = core.YearMonthBucket(open.EntryTime)
+				open.YearQuarter = core.YearQuarterBucket(open.EntryTime)
 				open.CandlesToExit = open.ExitIdx - open.EntryIdx
 				trades = append(trades, *open)
 				open = nil
@@ -322,11 +325,11 @@ func simulateOOS(candles []Candle, p engine.BacktestParams, weights map[string]f
 			continue
 		}
 		// Bias filter — match RunBacktest's contract: 0 = unknown/neutral passes.
-		if bias := p.H4Bias.Lookup(c.Time); bias != 0 {
-			if bias > 0 && cs.Side == Short {
+		if b := p.H4Bias.Lookup(c.Time); b != 0 {
+			if b > 0 && cs.Side == core.Short {
 				continue
 			}
-			if bias < 0 && cs.Side == Long {
+			if b < 0 && cs.Side == core.Long {
 				continue
 			}
 		}
@@ -334,23 +337,23 @@ func simulateOOS(candles []Candle, p engine.BacktestParams, weights map[string]f
 		// Premium/Discount filter on the composite entry.
 		if p.PDLookback > 0 {
 			dr := smc.CurrentDealingRange(candles, i, p.PDLookback)
-			if cs.Side == Long && dr.InPremium(cs.BestEntry) {
+			if cs.Side == core.Long && dr.InPremium(cs.BestEntry) {
 				continue
 			}
-			if cs.Side == Short && dr.InDiscount(cs.BestEntry) {
+			if cs.Side == core.Short && dr.InDiscount(cs.BestEntry) {
 				continue
 			}
 		}
 
 		entry, sl, tp := cs.BestEntry, cs.BestSL, cs.BestTP
 		if p.ATRMult > 0 && p.ATRPeriod > 0 {
-			atr := ATRAt(candles, i, p.ATRPeriod)
+			atr := indicator.ATRAt(candles, i, p.ATRPeriod)
 			if atr > 0 {
 				mult := p.ATRMult * engine.SessionATRScale(c.Time)
 				structuralD := math.Abs(entry - sl)
 				atrD := atr * mult
 				if atrD > structuralD {
-					if cs.Side == Long {
+					if cs.Side == core.Long {
 						sl = entry - atrD
 						tp = entry + atrD*strategy.DefaultRR
 					} else {
@@ -363,12 +366,12 @@ func simulateOOS(candles []Candle, p engine.BacktestParams, weights map[string]f
 		if p.MaxSLPoints > 0 && math.Abs(entry-sl) > p.MaxSLPoints {
 			continue
 		}
-		if cs.Side == Long {
+		if cs.Side == core.Long {
 			entry += p.SpreadDollar
 		} else {
 			entry -= p.SpreadDollar
 		}
-		open = &Trade{
+		open = &core.Trade{
 			Strategy:  "Composite",
 			Side:      cs.Side,
 			EntryIdx:  i,
@@ -410,10 +413,10 @@ func summarizeWFAWindow(w *WFAWindow) {
 }
 
 // combinedStats rebuilds the running balance over the concatenated OOS trades
-// and feeds the result through computeStats so every published metric (Sharpe,
-// Calmar, MaxDD, AnnRet…) is computed against the unified curve, not stitched
-// together from per-window stats.
-func combinedStats(trades []Trade, p engine.BacktestParams) engine.BacktestStats {
+// and feeds the result through engine.ComputeStats so every published metric
+// (Sharpe, Calmar, MaxDD, AnnRet…) is computed against the unified curve,
+// not stitched together from per-window stats.
+func combinedStats(trades []core.Trade, p engine.BacktestParams) engine.BacktestStats {
 	balance := p.StartBalance
 	peak := balance
 	maxDD := 0.0
@@ -448,7 +451,7 @@ func SaveWFARun(ctx context.Context, pool *pgxpool.Pool, cfg WFAConfig, res WFAR
 	if len(res.Windows) == 0 {
 		return 0, fmt.Errorf("no WFA windows to persist")
 	}
-	statsJSON, err := jsonMarshal(res.CombinedStats)
+	statsJSON, err := json.Marshal(res.CombinedStats)
 	if err != nil {
 		return 0, fmt.Errorf("marshal stats: %w", err)
 	}

@@ -17,6 +17,7 @@ import (
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/meta"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy/xasset"
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/wfa"
 )
 
 // run is the CLI dispatcher invoked from main().
@@ -471,7 +472,7 @@ func runWFA(args []string) int {
 	}
 	defer pool.Close()
 
-	cfg := WFAConfig{
+	cfg := wfa.WFAConfig{
 		Symbol: *symbol, Interval: *interval,
 		ISWindowMonths: *is, OOSWindowMonths: *oos, StepMonths: *step,
 		Threshold: *threshold, UseBias: *useBias, ATRMult: *atrMult, H4Period: *h4Period,
@@ -479,7 +480,20 @@ func runWFA(args []string) int {
 		Slippage:         *slippage,
 		SlippageNewsMult: *slippageNewsMult,
 	}
-	res, err := RunWFA(ctx, pool, cfg)
+	candles, err := loadCandles(ctx, pool, cfg.Symbol, cfg.Interval, cfg.StartDate, cfg.EndDate)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load candles: %v\n", err)
+		return 1
+	}
+	var h4Candles []Candle
+	if cfg.UseBias {
+		h4Candles, err = loadCandles(ctx, pool, cfg.Symbol, "4h", cfg.StartDate, cfg.EndDate)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load h4: %v\n", err)
+			return 1
+		}
+	}
+	res, err := wfa.RunWFA(cfg, candles, h4Candles)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "wfa: %v\n", err)
 		return 1
@@ -514,7 +528,7 @@ func runWFA(args []string) int {
 		s.StartBalance, s.EndBalance, (s.EndBalance-s.StartBalance)/s.StartBalance*100)
 
 	if *persist {
-		runID, err := SaveWFARun(ctx, pool, cfg, res)
+		runID, err := wfa.SaveWFARun(ctx, pool, cfg, res)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "persist: %v\n", err)
 			return 1
