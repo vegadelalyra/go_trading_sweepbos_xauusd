@@ -254,7 +254,7 @@ func runBacktestCLI(args []string) int {
 		if len(h4) < *h4Period+10 {
 			fmt.Fprintf(os.Stderr, "not enough H4 candles (%d) for bias period %d\n", len(h4), *h4Period)
 		} else {
-			params.H4Bias = BuildBiasMap(h4, *h4Period)
+			params.H4Bias = BuildBiasMap(h4, *h4Period, 4*time.Hour)
 			fmt.Printf("Bias filter ON  (H4 EMA%d, %d bars)\n", *h4Period, len(h4))
 		}
 	}

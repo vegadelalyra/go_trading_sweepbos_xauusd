@@ -46,9 +46,14 @@ func EMA(values []float64, period int) []float64 {
 
 // BuildBiasMap derives a per-bar trend bias from H4 candles using EMA(emaPeriod)
 // of the close. Bias is +1 (close above EMA), -1 (below), or 0 (equal/unseeded).
-// The result is sorted by Time so Lookup can binary-search; we assume the input
-// is already chronological (loadCandles ORDER BY bar_time ASC) but sort defensively.
-func BuildBiasMap(h4Candles []Candle, emaPeriod int) BiasMap {
+//
+// barDuration is the span of one input candle (e.g. 4*time.Hour for H4). Each
+// bias point is indexed by its CLOSE time (open + barDuration) so Lookup(t)
+// will never return a bar that hasn't finished printing by t. Without this,
+// a 15m candle at 11:45 would consult the H4 bar that opened at 08:00 — which
+// doesn't close until 12:00 — leaking the next 15 minutes of the H4 close
+// (and therefore the EMA cross direction) into a "live" decision.
+func BuildBiasMap(h4Candles []Candle, emaPeriod int, barDuration time.Duration) BiasMap {
 	n := len(h4Candles)
 	if n == 0 || emaPeriod <= 0 {
 		return BiasMap{points: nil}
@@ -72,8 +77,9 @@ func BuildBiasMap(h4Candles []Candle, emaPeriod int) BiasMap {
 		case h4Candles[i].Close < ema[i]:
 			b = -1
 		}
-		// Normalize to UTC so Lookup(t.UTC()) and Lookup(t.Local()) match.
-		points = append(points, biasPoint{T: h4Candles[i].Time.UTC(), Bias: b})
+		// Index by CLOSE time, not OPEN time. UTC normalized so callers using
+		// any timezone get the same answer.
+		points = append(points, biasPoint{T: h4Candles[i].Time.UTC().Add(barDuration), Bias: b})
 	}
 	// Defensive sort: cheap (already-sorted input is O(n) for sort.SliceStable).
 	sort.SliceStable(points, func(i, j int) bool {
@@ -82,9 +88,10 @@ func BuildBiasMap(h4Candles []Candle, emaPeriod int) BiasMap {
 	return BiasMap{points: points}
 }
 
-// Lookup returns the bias of the most recent H4 bar whose Time <= t.
-// Returns 0 when t precedes every bar in the map (or the map is empty),
-// matching the "neutral / unknown" contract documented at the call sites.
+// Lookup returns the bias of the most recent H4 bar that has already CLOSED by t.
+// Because BuildBiasMap indexes points by close-time, the same binary search
+// gives the no-leak answer: any bar still open at t sits after t in the slice
+// and is excluded. Returns 0 when no closed bar precedes t (or the map is empty).
 func (bm BiasMap) Lookup(t time.Time) int {
 	if len(bm.points) == 0 {
 		return 0
