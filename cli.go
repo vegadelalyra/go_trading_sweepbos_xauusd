@@ -7,11 +7,14 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/bias"
@@ -52,6 +55,8 @@ func run(args []string) int {
 		return runBootstrap(args[2:])
 	case "paper-replay":
 		return runPaperReplay(args[2:])
+	case "paper-live":
+		return runPaperLive(args[2:])
 	case "live-signal":
 		return runLiveSignal(args[2:])
 	case "import-cache":
@@ -82,6 +87,7 @@ SUBCOMMANDS
   wfa           walk-forward analysis: rolling IS→OOS windows
   bootstrap     stationary block bootstrap CIs over a stored run's trades
   paper-replay  replay composite signals over historical candles with FIXED weights and persist results
+  paper-live    long-running paper-trader: REST-poll latest candle every interval, signal, grade, persist
   live-signal   stream live ticks (TD WSS) and recompose the signal on REST polls
   import-cache  one-shot import of the legacy JSON cache into Postgres
 
@@ -820,6 +826,159 @@ func runPaperReplay(args []string) int {
 		fmt.Printf("\nPersisted as paper_runs.id=%d with %d trades\n", paperID, len(res.Trades))
 	}
 	return 0
+}
+
+// stdoutLogger satisfies paper.Logger by printing to stdout with a clock
+// stamp. The paper-live loop calls Log(...) for every interesting moment
+// (sleep, fetch, signal, grade) so users can tail the script and see the
+// system reasoning in real time. Errors are NOT printed via Log — they
+// stay on stderr.
+type stdoutLogger struct{}
+
+func (stdoutLogger) Log(format string, args ...any) {
+	fmt.Printf("[%s] %s\n", time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
+}
+
+func runPaperLive(args []string) int {
+	fs := flag.NewFlagSet("paper-live", flag.ContinueOnError)
+	runID := fs.Int64("run-id", 0, "backtest_runs.id whose weights drive the live signals (0 = latest)")
+	paperRun := fs.String("paper-run", "", "comma-separated paper_runs.id list to UNION into the weight calc")
+	symbol := fs.String("symbol", "XAU/USD", "symbol to trade")
+	interval := fs.String("interval", "15m", "candle interval (15m/1h/4h)")
+	threshold := fs.Float64("threshold", 2.0, "composite |NetWeight| threshold for an entry")
+	pdLookback := fs.Int("pd-lookback", 96, "Premium/Discount filter lookback in candles (0 disables, 96 = 24h on 15m)")
+	slippage := fs.Float64("slippage", 0, "SL slippage in dollars (0 disables)")
+	slippageNewsMult := fs.Float64("slippage-news-mult", 1.0, "multiplier applied to slippage in news windows")
+	bySession := fs.Bool("by-session", false, "use per-session weight table instead of the global one")
+	pollSeconds := fs.Int("poll-seconds", 0, "fixed poll cadence in seconds; 0 = align to interval boundary (recommended for free tier)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	paperRunIDs, err := parsePaperRunIDs(*paperRun)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+
+	apiKey := os.Getenv("TWELVEDATA_API_KEY")
+	if apiKey == "" {
+		fmt.Fprintln(os.Stderr, "ERROR: define TWELVEDATA_API_KEY in .env (free tier is enough)")
+		return 1
+	}
+
+	// SIGINT/SIGTERM → graceful shutdown: the loop finalizes the
+	// paper_runs row, prints a summary, and exits 0. Without this the
+	// run would still be queryable (the row was inserted at startup) but
+	// ended_at would stay equal to started_at.
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	pool, err := openPool(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "db: %v\n", err)
+		return 1
+	}
+	defer pool.Close()
+
+	id := *runID
+	if id == 0 {
+		if err := pool.QueryRow(ctx, `SELECT id FROM backtest_runs ORDER BY id DESC LIMIT 1`).Scan(&id); err != nil {
+			fmt.Fprintf(os.Stderr, "find latest backtest run: %v\n", err)
+			return 1
+		}
+	}
+
+	// Resolve weight table ONCE at startup. To incorporate new paper
+	// outcomes mid-run the user restarts the script with `-paper-run=N`
+	// pointing to the just-completed run — same loop, fresher weights.
+	var (
+		flat      map[string]float64
+		bySessTbl map[string]map[string]float64
+	)
+	if *bySession {
+		bySessTbl, err = meta.LoadWeightsBySession(ctx, pool, id, paperRunIDs...)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load weights-by-session: %v\n", err)
+			return 1
+		}
+	} else {
+		ws, err := meta.LoadWeights(ctx, pool, id, paperRunIDs...)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load weights: %v\n", err)
+			return 1
+		}
+		flat = meta.WeightMap(ws)
+	}
+
+	cfg := paper.LiveConfig{
+		SourceRunID: id, BySession: *bySession,
+		Symbol: *symbol, Interval: *interval,
+		Threshold:        *threshold,
+		PDLookback:       *pdLookback,
+		Slippage:         *slippage,
+		SlippageNewsMult: *slippageNewsMult,
+		PollSeconds:      *pollSeconds,
+		APIKey:           apiKey,
+		HTTPClient:       &http.Client{Timeout: 30 * time.Second},
+	}
+
+	fmt.Printf("═══ Paper Live — %s %s ═══\n", *symbol, *interval)
+	fmt.Printf("  Source weights: backtest_runs.id=%d  ·  bySession=%t  ·  threshold=%.2f\n",
+		id, *bySession, *threshold)
+	if len(paperRunIDs) > 0 {
+		fmt.Printf("  Feedback paper runs: %v\n", paperRunIDs)
+	}
+	if *pollSeconds > 0 {
+		fmt.Printf("  Poll cadence: every %ds (fixed)\n", *pollSeconds)
+	} else {
+		fmt.Printf("  Poll cadence: aligned to %s boundary + 10s slack (~%d API calls/day)\n",
+			*interval, callsPerDay(*interval))
+	}
+	fmt.Println("  Press Ctrl+C to stop and finalize the run.")
+	fmt.Println()
+
+	paperRunID, err := paper.RunLive(ctx, pool, cfg, flat, bySessTbl, stdoutLogger{})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "live: %v\n", err)
+		return 1
+	}
+
+	// Print the closing summary using the persisted paper_trades rows so
+	// it reflects what's actually saved, not in-memory state.
+	summarizeLiveRun(context.Background(), pool, paperRunID)
+	return 0
+}
+
+// callsPerDay estimates the daily REST request count for a given interval
+// at the default aligned cadence. Used only for the startup banner so the
+// user knows whether their TD quota is at risk.
+func callsPerDay(interval string) int {
+	switch interval {
+	case "15m":
+		return 24 * 4 // 96
+	case "1h":
+		return 24
+	case "4h":
+		return 6
+	case "1d":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func summarizeLiveRun(ctx context.Context, pool *pgxpool.Pool, paperRunID int64) {
+	var closed, open int
+	var netR *float64
+	_ = pool.QueryRow(ctx, `SELECT COUNT(*), COALESCE(SUM(r_realized), 0) FROM paper_trades WHERE paper_run_id=$1`, paperRunID).Scan(&closed, &netR)
+	_ = pool.QueryRow(ctx, `SELECT COUNT(*) FROM paper_pending WHERE paper_run_id=$1`, paperRunID).Scan(&open)
+	fmt.Println()
+	fmt.Printf("── Live run paper_runs.id=%d summary ──────────────────────\n", paperRunID)
+	fmt.Printf("  closed=%d  pending=%d\n", closed, open)
+	if netR != nil {
+		fmt.Printf("  NetR=%+.2f  (closed trades only)\n", *netR)
+	}
+	fmt.Printf("\n  Inspect: psql -c \"SELECT entry_time, strategy, side, r_realized, win FROM paper_trades WHERE paper_run_id=%d ORDER BY entry_time;\"\n", paperRunID)
 }
 
 func runImportCache(args []string) int {
