@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/engine"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/metrics"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/smc"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy"
@@ -54,7 +55,7 @@ type WFAWindow struct {
 type WFAResult struct {
 	Windows        []WFAWindow
 	CombinedTrades []Trade
-	CombinedStats  BacktestStats
+	CombinedStats  engine.BacktestStats
 	WindowsCount   int
 }
 
@@ -100,7 +101,7 @@ func RunWFA(ctx context.Context, pool *pgxpool.Pool, cfg WFAConfig) (WFAResult, 
 			continue
 		}
 
-		params := ParamsFor(cfg.Interval)
+		params := engine.ParamsFor(cfg.Interval)
 		if cfg.UseBias && len(h4Candles) > 0 {
 			h4Slice := sliceByTime(h4Candles, isStart, oosEnd)
 			params.H4Bias = BuildBiasMap(h4Slice, cfg.H4Period, 4*time.Hour)
@@ -113,7 +114,7 @@ func RunWFA(ctx context.Context, pool *pgxpool.Pool, cfg WFAConfig) (WFAResult, 
 		params.SlippagePoints = cfg.Slippage
 		params.SlippageNewsMult = cfg.SlippageNewsMult
 
-		isResult := RunBacktest(isCandles, strategy.All(), params)
+		isResult := engine.RunBacktest(isCandles, strategy.All(), params)
 		weightsList := computeWeights(isResult.Trades)
 		weights := make(map[string]float64, len(weightsList))
 		for _, w := range weightsList {
@@ -137,7 +138,7 @@ func RunWFA(ctx context.Context, pool *pgxpool.Pool, cfg WFAConfig) (WFAResult, 
 
 	result.WindowsCount = len(result.Windows)
 	if len(result.CombinedTrades) > 0 {
-		result.CombinedStats = combinedStats(result.CombinedTrades, ParamsFor(cfg.Interval))
+		result.CombinedStats = combinedStats(result.CombinedTrades, engine.ParamsFor(cfg.Interval))
 	}
 	return result, nil
 }
@@ -205,7 +206,7 @@ func computeWeights(trades []Trade) []StrategyWeight {
 // strategy votes and only the weighted majority — already known from the IS
 // window — produces an entry. The lifecycle (SL/TP/time-stop/spread/ATR/SL guard)
 // matches RunBacktest exactly so OOS realism is preserved.
-func simulateOOS(candles []Candle, p BacktestParams, weights map[string]float64, threshold float64) []Trade {
+func simulateOOS(candles []Candle, p engine.BacktestParams, weights map[string]float64, threshold float64) []Trade {
 	a := Analyze(candles)
 	balance := p.StartBalance
 	dayStart := balance
@@ -226,7 +227,7 @@ func simulateOOS(candles []Candle, p BacktestParams, weights map[string]float64,
 
 		if open != nil {
 			closed := false
-			slip := slPenalty(p, c.Time)
+			slip := engine.SLPenalty(p, c.Time)
 			if open.Side == Long {
 				if c.Low <= open.SL {
 					if slip > 0 {
@@ -344,7 +345,7 @@ func simulateOOS(candles []Candle, p BacktestParams, weights map[string]float64,
 		if p.ATRMult > 0 && p.ATRPeriod > 0 {
 			atr := ATRAt(candles, i, p.ATRPeriod)
 			if atr > 0 {
-				mult := p.ATRMult * sessionATRScale(c.Time)
+				mult := p.ATRMult * engine.SessionATRScale(c.Time)
 				structuralD := math.Abs(entry - sl)
 				atrD := atr * mult
 				if atrD > structuralD {
@@ -411,7 +412,7 @@ func summarizeWFAWindow(w *WFAWindow) {
 // and feeds the result through computeStats so every published metric (Sharpe,
 // Calmar, MaxDD, AnnRet…) is computed against the unified curve, not stitched
 // together from per-window stats.
-func combinedStats(trades []Trade, p BacktestParams) BacktestStats {
+func combinedStats(trades []Trade, p engine.BacktestParams) engine.BacktestStats {
 	balance := p.StartBalance
 	peak := balance
 	maxDD := 0.0
@@ -428,7 +429,7 @@ func combinedStats(trades []Trade, p BacktestParams) BacktestStats {
 			}
 		}
 	}
-	return computeStats(trades, p, maxDD, balance)
+	return engine.ComputeStats(trades, p, maxDD, balance)
 }
 
 // SaveWFARun persists a WFA result to wfa_runs + wfa_trades atomically.

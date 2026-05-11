@@ -15,6 +15,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/engine"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy"
 )
 
@@ -56,7 +57,7 @@ type candlesMsg struct {
 
 type errMsg struct{ err error }
 
-type backtestMsg struct{ result BacktestResult }
+type backtestMsg struct{ result engine.BacktestResult }
 
 var (
 	bullStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#22c55e"))
@@ -101,7 +102,7 @@ type model struct {
 	credits   int
 	loading   bool
 	err       error
-	result    *BacktestResult
+	result    *engine.BacktestResult
 	running   bool
 	status    string
 	statsView bool
@@ -160,7 +161,7 @@ func loadBacktestDataCmd(pool *pgxpool.Pool) tea.Cmd {
 
 func runBacktestCmd(candles []Candle) tea.Cmd {
 	return func() tea.Msg {
-		r := RunBacktest(candles, strategy.All(), DefaultParams())
+		r := engine.RunBacktest(candles, strategy.All(), engine.DefaultParams())
 		return backtestMsg{result: r}
 	}
 }

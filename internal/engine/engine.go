@@ -1,10 +1,19 @@
-package main
+// Package engine owns the backtest simulator: parameters, statistics
+// accumulation and the candle-by-candle execution loop. It depends on
+// core (Candle, Trade, Side, session helpers), smc (Analyze, dealing-range
+// premium/discount), indicator (ATR), bias (H4 filter) and the strategy
+// catalog — but not on any caller (cli, wfa, tui, db), so any consumer
+// can replay the exact engine that produced a stored run.
+package engine
 
 import (
 	"fmt"
 	"math"
 	"time"
 
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/bias"
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/core"
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/indicator"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/metrics"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/smc"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy"
@@ -20,9 +29,9 @@ type BacktestParams struct {
 	MaxHoldCandles  int     // force-close after N candles open; 0 = no time stop
 	CooldownCandles int     // candles to wait after a closed trade
 	// F6 extensions — all optional, zero-values disable the feature.
-	H4Bias    BiasMap // if non-empty, reject signals whose Side disagrees with the H4 EMA200 bias at entry time
-	ATRPeriod int     // candles in ATR window (e.g. 14)
-	ATRMult   float64 // if >0, widen structural SL to max(structural, ATR × ATRMult)
+	H4Bias    bias.BiasMap // if non-empty, reject signals whose Side disagrees with the H4 EMA200 bias at entry time
+	ATRPeriod int          // candles in ATR window (e.g. 14)
+	ATRMult   float64      // if >0, widen structural SL to max(structural, ATR × ATRMult)
 	// Premium/Discount zone filter. If > 0, longs are accepted only when
 	// the entry sits in the lower half of the most-recent N-bar dealing
 	// range, shorts only in the upper half — the smart-money "buy
@@ -92,13 +101,13 @@ type BacktestStats struct {
 	Duration     map[string][]int
 	RDist        map[string][]float64
 	// F6 metrics.
-	Sharpe            float64
-	RecoveryFactor    float64
-	Calmar            float64
-	AnnualReturnPct   float64
-	MaxLossStreak     int
-	MaxWinStreak      int
-	DaysCovered       int
+	Sharpe          float64
+	RecoveryFactor  float64
+	Calmar          float64
+	AnnualReturnPct float64
+	MaxLossStreak   int
+	MaxWinStreak    int
+	DaysCovered     int
 }
 
 type StrategyStats struct {
@@ -110,7 +119,7 @@ type StrategyStats struct {
 }
 
 type BacktestResult struct {
-	Trades []Trade
+	Trades []core.Trade
 	Stats  BacktestStats
 	Params BacktestParams
 }
@@ -119,8 +128,8 @@ type BacktestResult struct {
 // BacktestParams. Pass strategy.All() to use every registered strategy
 // (production case); pass a curated subset to test a single strategy in
 // isolation. Order matters — the engine fires the first match per candle.
-func RunBacktest(candles []Candle, strategies []strategy.Strategy, p BacktestParams) BacktestResult {
-	a := Analyze(candles)
+func RunBacktest(candles []core.Candle, strategies []strategy.Strategy, p BacktestParams) BacktestResult {
+	a := smc.Analyze(candles)
 
 	balance := p.StartBalance
 	peak := balance
@@ -129,13 +138,13 @@ func RunBacktest(candles []Candle, strategies []strategy.Strategy, p BacktestPar
 	dayStart := balance
 	currentDay := -1
 
-	var trades []Trade
-	var open *Trade
+	var trades []core.Trade
+	var open *core.Trade
 	cooldown := 0
 
 	for i := p.MinIndex; i < len(candles); i++ {
 		c := candles[i]
-		ny := toNY(c.Time)
+		ny := core.ToNY(c.Time)
 		yd := ny.YearDay()
 		if yd != currentDay {
 			currentDay = yd
@@ -147,8 +156,8 @@ func RunBacktest(candles []Candle, strategies []strategy.Strategy, p BacktestPar
 
 		if open != nil {
 			closed := false
-			slip := slPenalty(p, c.Time)
-			if open.Side == Long {
+			slip := SLPenalty(p, c.Time)
+			if open.Side == core.Long {
 				if c.Low <= open.SL {
 					if slip > 0 {
 						// Worst-case fill: cap at c.Low so a gap past
@@ -202,7 +211,7 @@ func RunBacktest(candles []Candle, strategies []strategy.Strategy, p BacktestPar
 			// The P/L is whatever fraction of risk we've banked so far.
 			if !closed && p.MaxHoldCandles > 0 && i-open.EntryIdx >= p.MaxHoldCandles {
 				open.ExitPrice = c.Close
-				if open.Side == Long {
+				if open.Side == core.Long {
 					riskDist := open.Entry - open.SL
 					if riskDist > 0 {
 						open.R = (c.Close - open.Entry) / riskDist
@@ -222,9 +231,9 @@ func RunBacktest(candles []Candle, strategies []strategy.Strategy, p BacktestPar
 				open.ExitIdx = i
 				open.ExitTime = c.Time
 				open.BalanceAfter = balance
-				open.Session = classifySession(open.EntryTime)
-				open.YearMonth = yearMonthBucket(open.EntryTime)
-				open.YearQuarter = yearQuarterBucket(open.EntryTime)
+				open.Session = core.ClassifySession(open.EntryTime)
+				open.YearMonth = core.YearMonthBucket(open.EntryTime)
+				open.YearQuarter = core.YearQuarterBucket(open.EntryTime)
 				open.CandlesToExit = open.ExitIdx - open.EntryIdx
 				trades = append(trades, *open)
 				open = nil
@@ -259,11 +268,11 @@ func RunBacktest(candles []Candle, strategies []strategy.Strategy, p BacktestPar
 			// F6 — Multi-TF bias filter: reject signals fighting the H4 trend.
 			// Lookup returns 0 when the BiasMap is empty OR when bias is neutral —
 			// both cases pass through without filtering.
-			if bias := p.H4Bias.Lookup(candles[i].Time); bias != 0 {
-				if bias > 0 && sig.Side == Short {
+			if b := p.H4Bias.Lookup(candles[i].Time); b != 0 {
+				if b > 0 && sig.Side == core.Short {
 					continue
 				}
-				if bias < 0 && sig.Side == Long {
+				if b < 0 && sig.Side == core.Long {
 					continue
 				}
 			}
@@ -273,13 +282,13 @@ func RunBacktest(candles []Candle, strategies []strategy.Strategy, p BacktestPar
 			// shrink the multiplier there; NY-PM and the dead "off" band
 			// also drift quieter. London and NY-AM keep the full multiplier.
 			if p.ATRMult > 0 && p.ATRPeriod > 0 {
-				atr := ATRAt(candles, i, p.ATRPeriod)
+				atr := indicator.ATRAt(candles, i, p.ATRPeriod)
 				if atr > 0 {
-					mult := p.ATRMult * sessionATRScale(c.Time)
+					mult := p.ATRMult * SessionATRScale(c.Time)
 					structuralD := math.Abs(sig.Entry - sig.SL)
 					atrD := atr * mult
 					if atrD > structuralD {
-						if sig.Side == Long {
+						if sig.Side == core.Long {
 							sig.SL = sig.Entry - atrD
 							sig.TP = sig.Entry + atrD*strategy.DefaultRR
 						} else {
@@ -295,10 +304,10 @@ func RunBacktest(candles []Candle, strategies []strategy.Strategy, p BacktestPar
 			// side of institutional value.
 			if p.PDLookback > 0 {
 				dr := smc.CurrentDealingRange(candles, i, p.PDLookback)
-				if sig.Side == Long && dr.InPremium(sig.Entry) {
+				if sig.Side == core.Long && dr.InPremium(sig.Entry) {
 					continue
 				}
-				if sig.Side == Short && dr.InDiscount(sig.Entry) {
+				if sig.Side == core.Short && dr.InDiscount(sig.Entry) {
 					continue
 				}
 			}
@@ -309,12 +318,12 @@ func RunBacktest(candles []Candle, strategies []strategy.Strategy, p BacktestPar
 					continue
 				}
 			}
-			if sig.Side == Long {
+			if sig.Side == core.Long {
 				sig.Entry += p.SpreadDollar
 			} else {
 				sig.Entry -= p.SpreadDollar
 			}
-			t := Trade{
+			t := core.Trade{
 				Strategy:  sig.Strategy,
 				Side:      sig.Side,
 				EntryIdx:  i,
@@ -330,12 +339,15 @@ func RunBacktest(candles []Candle, strategies []strategy.Strategy, p BacktestPar
 
 	return BacktestResult{
 		Trades: trades,
-		Stats:  computeStats(trades, p, maxDDPct, balance),
+		Stats:  ComputeStats(trades, p, maxDDPct, balance),
 		Params: p,
 	}
 }
 
-func computeStats(trades []Trade, p BacktestParams, maxDDPct, endBal float64) BacktestStats {
+// ComputeStats aggregates a trade slice into the headline + bucket stats
+// used by every reporter. Exported because wfa.combinedStats needs to call
+// it on the concatenated OOS curve.
+func ComputeStats(trades []core.Trade, p BacktestParams, maxDDPct, endBal float64) BacktestStats {
 	s := BacktestStats{
 		StartBalance: p.StartBalance,
 		EndBalance:   endBal,
@@ -401,7 +413,7 @@ func computeStats(trades []Trade, p BacktestParams, maxDDPct, endBal float64) Ba
 	return s
 }
 
-func bumpStats(m map[string]StrategyStats, key string, t Trade) {
+func bumpStats(m map[string]StrategyStats, key string, t core.Trade) {
 	s := m[key]
 	s.Total++
 	if t.Win {
@@ -416,12 +428,12 @@ func bumpStats(m map[string]StrategyStats, key string, t Trade) {
 	m[key] = s
 }
 
-// slPenalty returns the dollar slippage applied to an SL-hit exit price for
+// SLPenalty returns the dollar slippage applied to an SL-hit exit price for
 // candle c. Default (SlippagePoints == 0) preserves the old behaviour of
 // filling at the SL exactly. When set, the engine pretends price gapped a
 // few cents past the stop — and multiplies the penalty during the news
 // windows that produce most gold gap-and-go moves.
-func slPenalty(p BacktestParams, t time.Time) float64 {
+func SLPenalty(p BacktestParams, t time.Time) float64 {
 	if p.SlippagePoints <= 0 {
 		return 0
 	}
@@ -436,29 +448,29 @@ func slPenalty(p BacktestParams, t time.Time) float64 {
 // moves: 08 (early macro releases), 09 (cash open), 10 (ISM/JOLTS slot)
 // and 14 (FOMC / PPI / late releases).
 func isHighVolatilityWindow(t time.Time) bool {
-	h := toNY(t).Hour()
+	h := core.ToNY(t).Hour()
 	return h == 8 || h == 9 || h == 10 || h == 14
 }
 
-// sessionATRScale returns the multiplier applied to BacktestParams.ATRMult
+// SessionATRScale returns the multiplier applied to BacktestParams.ATRMult
 // based on the candle's session. The numbers come from measuring 15m ATR
 // medians per session over the 2y XAU dataset — Asia prints roughly 0.67×
 // the London/NY range, NY-PM trails at 0.85×, the dead band at 0.80×.
 // Returning 1.0 for the active sessions keeps existing tunings intact.
-func sessionATRScale(t time.Time) float64 {
-	switch classifySession(t) {
-	case SessionAsia:
+func SessionATRScale(t time.Time) float64 {
+	switch core.ClassifySession(t) {
+	case core.SessionAsia:
 		return 0.67
-	case SessionLondon, SessionNYAM:
+	case core.SessionLondon, core.SessionNYAM:
 		return 1.0
-	case SessionNYPM:
+	case core.SessionNYPM:
 		return 0.85
 	default:
 		return 0.80
 	}
 }
 
-func bumpNestedStats(m map[string]map[string]StrategyStats, strategy, bucket string, t Trade) {
+func bumpNestedStats(m map[string]map[string]StrategyStats, strategy, bucket string, t core.Trade) {
 	if m[strategy] == nil {
 		m[strategy] = make(map[string]StrategyStats)
 	}

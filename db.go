@@ -10,6 +10,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/engine"
 )
 
 func jsonEncoder(v any) ([]byte, error) { return json.Marshal(v) }
@@ -131,7 +133,7 @@ type CoverageRow struct {
 
 // saveBacktestRun persists a backtest result: one row in backtest_runs and
 // one row per executed trade in backtest_trades. Returns the new run id.
-func saveBacktestRun(ctx context.Context, pool *pgxpool.Pool, symbol, interval string, candles []Candle, r BacktestResult) (int64, error) {
+func saveBacktestRun(ctx context.Context, pool *pgxpool.Pool, symbol, interval string, candles []Candle, r engine.BacktestResult) (int64, error) {
 	if len(candles) == 0 {
 		return 0, fmt.Errorf("no candles in result")
 	}

@@ -13,6 +13,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/joho/godotenv"
 
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/engine"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy/xasset"
 )
@@ -260,7 +261,7 @@ func runBacktestCLI(args []string) int {
 		candles[0].Time.Format("2006-01-02 15:04"),
 		candles[len(candles)-1].Time.Format("2006-01-02 15:04"))
 
-	params := ParamsFor(*interval)
+	params := engine.ParamsFor(*interval)
 	if *useBias {
 		h4, err := loadCandles(ctx, pool, *symbol, "4h", from, to)
 		if err != nil {
@@ -297,7 +298,7 @@ func runBacktestCLI(args []string) int {
 			fmt.Printf("XAG candles loaded (%d 1h bars) — XAUXAGPairs active\n", len(xag))
 		}
 	}
-	result := RunBacktest(candles, strategy.All(), params)
+	result := engine.RunBacktest(candles, strategy.All(), params)
 	printBacktestReport(*symbol, *interval, result)
 
 	if *persist {
@@ -575,7 +576,7 @@ func runBootstrap(args []string) int {
 		return 1
 	}
 
-	br := StationaryBlockBootstrap(trades, *iterations, *blockLen, DefaultParams().StartBalance, DefaultParams().RiskPct)
+	br := StationaryBlockBootstrap(trades, *iterations, *blockLen, engine.DefaultParams().StartBalance, engine.DefaultParams().RiskPct)
 	fmt.Printf("\n═══ %s ═══\n", header)
 	fmt.Print(formatBootstrap(br, len(trades)))
 	return 0

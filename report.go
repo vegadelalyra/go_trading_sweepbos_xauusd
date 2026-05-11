@@ -5,18 +5,20 @@ import (
 	"math"
 	"sort"
 	"strings"
+
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/engine"
 )
 
 // printBacktestReport writes a CLI-friendly multi-bucket breakdown to stdout.
 // It shares its rendering logic with the TUI so a single source of truth
 // describes every panel.
-func printBacktestReport(symbol, interval string, r BacktestResult) {
+func printBacktestReport(symbol, interval string, r engine.BacktestResult) {
 	fmt.Print(buildBacktestReport(symbol, interval, r))
 }
 
 // buildBacktestReport returns the same content as printBacktestReport as a
 // single string — used by the TUI stats view.
-func buildBacktestReport(symbol, interval string, r BacktestResult) string {
+func buildBacktestReport(symbol, interval string, r engine.BacktestResult) string {
 	var b strings.Builder
 	s := r.Stats
 	fmt.Fprintf(&b, "═══ %s %s — Backtest Report ═══\n", symbol, interval)
@@ -111,7 +113,7 @@ func buildBacktestReport(symbol, interval string, r BacktestResult) string {
 	return b.String()
 }
 
-func headerLine(s BacktestStats) string {
+func headerLine(s engine.BacktestStats) string {
 	pf := fmt.Sprintf("%.2f", s.ProfitFactor)
 	if math.IsInf(s.ProfitFactor, 1) {
 		pf = "∞"
@@ -137,7 +139,7 @@ func headerLine(s BacktestStats) string {
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
-func sortedKeys(m map[string]StrategyStats) []string {
+func sortedKeys(m map[string]engine.StrategyStats) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
 		out = append(out, k)
@@ -146,7 +148,7 @@ func sortedKeys(m map[string]StrategyStats) []string {
 	return out
 }
 
-func sortedKeysNested(m map[string]map[string]StrategyStats) []string {
+func sortedKeysNested(m map[string]map[string]engine.StrategyStats) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
 		out = append(out, k)
@@ -173,7 +175,7 @@ func sortedStringFloatKeys(m map[string][]float64) []string {
 	return out
 }
 
-func allBucketKeys(m map[string]map[string]StrategyStats) []string {
+func allBucketKeys(m map[string]map[string]engine.StrategyStats) []string {
 	seen := map[string]bool{}
 	for _, inner := range m {
 		for k := range inner {
