@@ -149,14 +149,22 @@ func RunBacktest(candles []Candle, strategies []strategy.Strategy, p BacktestPar
 			slip := slPenalty(p, c.Time)
 			if open.Side == Long {
 				if c.Low <= open.SL {
-					exit := open.SL - slip
-					if c.Low < exit {
-						exit = c.Low
+					if slip > 0 {
+						// Worst-case fill: cap at c.Low so a gap past
+						// SL+slip lands wherever price actually went.
+						exit := open.SL - slip
+						if c.Low < exit {
+							exit = c.Low
+						}
+						open.ExitPrice = exit - p.SpreadDollar
+						riskDist := open.Entry - open.SL
+						actualLoss := open.Entry - exit + p.SpreadDollar
+						open.R = -actualLoss / riskDist
+					} else {
+						// No slippage modelled — clean -1R fill at SL.
+						open.ExitPrice = open.SL - p.SpreadDollar
+						open.R = -1
 					}
-					open.ExitPrice = exit - p.SpreadDollar
-					riskDist := open.Entry - open.SL
-					actualLoss := open.Entry - exit + p.SpreadDollar
-					open.R = -actualLoss / riskDist
 					open.Win = false
 					closed = true
 				} else if c.High >= open.TP {
@@ -167,14 +175,19 @@ func RunBacktest(candles []Candle, strategies []strategy.Strategy, p BacktestPar
 				}
 			} else {
 				if c.High >= open.SL {
-					exit := open.SL + slip
-					if c.High > exit {
-						exit = c.High
+					if slip > 0 {
+						exit := open.SL + slip
+						if c.High > exit {
+							exit = c.High
+						}
+						open.ExitPrice = exit + p.SpreadDollar
+						riskDist := open.SL - open.Entry
+						actualLoss := exit - open.Entry + p.SpreadDollar
+						open.R = -actualLoss / riskDist
+					} else {
+						open.ExitPrice = open.SL + p.SpreadDollar
+						open.R = -1
 					}
-					open.ExitPrice = exit + p.SpreadDollar
-					riskDist := open.SL - open.Entry
-					actualLoss := exit - open.Entry + p.SpreadDollar
-					open.R = -actualLoss / riskDist
 					open.Win = false
 					closed = true
 				} else if c.Low <= open.TP {

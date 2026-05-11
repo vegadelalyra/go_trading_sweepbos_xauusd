@@ -227,14 +227,19 @@ func simulateOOS(candles []Candle, p BacktestParams, weights map[string]float64,
 			slip := slPenalty(p, c.Time)
 			if open.Side == Long {
 				if c.Low <= open.SL {
-					exit := open.SL - slip
-					if c.Low < exit {
-						exit = c.Low
+					if slip > 0 {
+						exit := open.SL - slip
+						if c.Low < exit {
+							exit = c.Low
+						}
+						open.ExitPrice = exit - p.SpreadDollar
+						riskDist := open.Entry - open.SL
+						actualLoss := open.Entry - exit + p.SpreadDollar
+						open.R = -actualLoss / riskDist
+					} else {
+						open.ExitPrice = open.SL - p.SpreadDollar
+						open.R = -1
 					}
-					open.ExitPrice = exit - p.SpreadDollar
-					riskDist := open.Entry - open.SL
-					actualLoss := open.Entry - exit + p.SpreadDollar
-					open.R = -actualLoss / riskDist
 					open.Win = false
 					closed = true
 				} else if c.High >= open.TP {
@@ -245,14 +250,19 @@ func simulateOOS(candles []Candle, p BacktestParams, weights map[string]float64,
 				}
 			} else {
 				if c.High >= open.SL {
-					exit := open.SL + slip
-					if c.High > exit {
-						exit = c.High
+					if slip > 0 {
+						exit := open.SL + slip
+						if c.High > exit {
+							exit = c.High
+						}
+						open.ExitPrice = exit + p.SpreadDollar
+						riskDist := open.SL - open.Entry
+						actualLoss := exit - open.Entry + p.SpreadDollar
+						open.R = -actualLoss / riskDist
+					} else {
+						open.ExitPrice = open.SL + p.SpreadDollar
+						open.R = -1
 					}
-					open.ExitPrice = exit + p.SpreadDollar
-					riskDist := open.SL - open.Entry
-					actualLoss := exit - open.Entry + p.SpreadDollar
-					open.R = -actualLoss / riskDist
 					open.Win = false
 					closed = true
 				} else if c.Low <= open.TP {
