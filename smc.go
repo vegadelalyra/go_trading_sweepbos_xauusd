@@ -130,8 +130,12 @@ func DetectFVGs(candles []Candle) []FVG {
 	return out
 }
 
-// BOS = body close beyond previous same-direction swing.
-// CHoCh = body close beyond the swing that produced the most recent BOS in the opposite direction.
+// BOS / CHoCh fire on strict CLOSE beyond the prior swing — never on body or wick.
+// A wick that pierces a swing but pulls back is a Liquidity Sweep, not a
+// structural break. The previous gate (body.high / body.low) silently accepted
+// candles that opened beyond the swing but closed inside it, polluting every
+// downstream consumer (OB detection, BreakerBlock, LiquiditySweepBoS, the H4
+// bias signal). This is the canonical ICT-correct definition.
 func DetectStructure(candles []Candle, swings []Swing) []StructureEvent {
 	out := make([]StructureEvent, 0)
 	if len(swings) == 0 {
@@ -140,9 +144,7 @@ func DetectStructure(candles []Candle, swings []Swing) []StructureEvent {
 
 	var lastBOSDir int // +1 bull, -1 bear, 0 none
 
-	for i := 0; i < len(candles); i++ {
-		body := candleBody(candles[i])
-
+	for i := range candles {
 		var nearestHigh, nearestLow *Swing
 		for s := range swings {
 			sw := &swings[s]
@@ -156,7 +158,7 @@ func DetectStructure(candles []Candle, swings []Swing) []StructureEvent {
 			}
 		}
 
-		if nearestHigh != nil && body.high > nearestHigh.Price {
+		if nearestHigh != nil && candles[i].Close > nearestHigh.Price {
 			kind := StructBOSBull
 			if lastBOSDir == -1 {
 				kind = StructCHoChBull
@@ -164,7 +166,7 @@ func DetectStructure(candles []Candle, swings []Swing) []StructureEvent {
 			out = append(out, StructureEvent{Index: i, Kind: kind, SwingIndex: nearestHigh.Index, SwingPrice: nearestHigh.Price})
 			lastBOSDir = 1
 		}
-		if nearestLow != nil && body.low < nearestLow.Price {
+		if nearestLow != nil && candles[i].Close < nearestLow.Price {
 			kind := StructBOSBear
 			if lastBOSDir == 1 {
 				kind = StructCHoChBear
@@ -174,15 +176,6 @@ func DetectStructure(candles []Candle, swings []Swing) []StructureEvent {
 		}
 	}
 	return out
-}
-
-type bodyRange struct{ low, high float64 }
-
-func candleBody(c Candle) bodyRange {
-	if c.Close >= c.Open {
-		return bodyRange{c.Open, c.Close}
-	}
-	return bodyRange{c.Close, c.Open}
 }
 
 // On a bullish BOS at index k, the OB is the last bearish candle before the impulsive move.
