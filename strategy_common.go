@@ -5,21 +5,6 @@ import (
 	"time"
 )
 
-// Signal is what a strategy emits when it detects a tradeable setup.
-// Strategies are responsible for picking entry, SL and TP that satisfy
-// validRR (and any other quality gate). The backtest engine adds the
-// spread, enforces MaxSLPoints, and tracks the lifecycle.
-type Signal struct {
-	Strategy string
-	Side     Side
-	Entry    float64
-	SL       float64
-	TP       float64
-	Index    int
-	Time     time.Time
-	Reason   string
-}
-
 // StrategyFn is the contract every strategy implements. Returning
 // (Signal, false) means "no setup right now"; the engine moves on.
 type StrategyFn func(candles []Candle, a Analysis, i int) (Signal, bool)

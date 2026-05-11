@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"math"
-	"time"
 )
 
 type BacktestParams struct {
@@ -50,26 +49,6 @@ func ParamsFor(interval string) BacktestParams {
 		p.MaxHoldCandles = 30 // 5 days
 	}
 	return p
-}
-
-type Trade struct {
-	Strategy      string
-	Side          Side
-	EntryIdx      int
-	ExitIdx       int
-	EntryTime     time.Time
-	ExitTime      time.Time
-	Entry         float64
-	SL            float64
-	TP            float64
-	ExitPrice     float64
-	R             float64
-	Win           bool
-	BalanceAfter  float64
-	Session       string
-	YearMonth     int
-	YearQuarter   int
-	CandlesToExit int
 }
 
 type BacktestStats struct {

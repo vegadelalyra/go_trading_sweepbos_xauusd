@@ -1,29 +1,5 @@
 package main
 
-import (
-	"sync"
-	"time"
-)
-
-type Candle struct {
-	Time                   time.Time
-	Open, High, Low, Close float64
-}
-
-type Side int
-
-const (
-	Long Side = iota
-	Short
-)
-
-func (s Side) String() string {
-	if s == Long {
-		return "LONG"
-	}
-	return "SHORT"
-}
-
 type Swing struct {
 	Index  int
 	Price  float64
@@ -83,24 +59,6 @@ func Analyze(candles []Candle) Analysis {
 		OrderBlocks: DetectOrderBlocks(candles, structure, swings, fvgs),
 	}
 }
-
-var (
-	nyOnce sync.Once
-	nyTZ   *time.Location
-)
-
-func nyLoc() *time.Location {
-	nyOnce.Do(func() {
-		l, err := time.LoadLocation("America/New_York")
-		if err != nil {
-			l = time.FixedZone("EST", -5*3600)
-		}
-		nyTZ = l
-	})
-	return nyTZ
-}
-
-func toNY(t time.Time) time.Time { return t.In(nyLoc()) }
 
 // 3-candle fractal: swing high if H[i] > H[i-1] && H[i] > H[i+1]; analogous for low.
 func DetectSwings(candles []Candle) []Swing {
