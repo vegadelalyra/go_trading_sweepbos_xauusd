@@ -14,30 +14,40 @@ import (
 
 // StrategyWeight summarises a strategy's historical edge in a single number.
 //
-// Formula:  weight = max(0, expectancy_R) * sqrt(trades)
+// Formula:  weight = max(0, expectancy_R / stddev_R) * log(trades + 1)
 //
-//   • Strategies with negative expectancy get weight 0 — they don't vote.
-//   • Among the survivors, the multiplier sqrt(N) rewards strategies with
-//     more trades (statistical confidence) without letting hyperactive
-//     overtraders dominate linearly. This is the same Kelly-flavored
-//     trick used in quant blending.
+//   • Numerator is a per-trade Sharpe analogue — expectancy normalised by
+//     realised dispersion. Two strategies with the same expectancy but one
+//     with 10× the variance receive very different weights.
+//   • Negative expectancy → ratio <= 0 → weight 0, the strategy doesn't vote.
+//   • log(N+1) compresses the bonus given to hyperactive over-traders. The
+//     previous sqrt(N) let a 1000-trade strategy carry 30× more weight than
+//     a 1-trade one even when the per-trade quality was identical; log
+//     dampens that to ~7×.
+//
+// Replaces the original max(0, expectancy) * sqrt(trades) formula, which
+// was variance-blind: fat-tail winners with long loss streaks got the same
+// weight as a steady-eddy strategy with the same average R.
 type StrategyWeight struct {
 	Strategy   string
 	Trades     int
 	Expectancy float64
+	StdDev     float64
 	WinRate    float64
 	NetR       float64
 	Weight     float64
 }
 
 // LoadWeights aggregates per-strategy stats from a stored backtest run and
-// returns one StrategyWeight per strategy that traded in that run.
+// returns one StrategyWeight per strategy that traded in that run. The
+// returned slice carries the variance-aware weight described on StrategyWeight.
 func LoadWeights(ctx context.Context, pool *pgxpool.Pool, runID int64) ([]StrategyWeight, error) {
 	rows, err := pool.Query(ctx, `
 		SELECT
 			strategy,
 			COUNT(*)::int                                              AS trades,
 			AVG(r_realized)::float8                                    AS expectancy,
+			COALESCE(STDDEV_POP(r_realized), 0)::float8                AS stddev_r,
 			(COUNT(*) FILTER (WHERE win))::float8 / COUNT(*)::float8   AS winrate,
 			SUM(r_realized)::float8                                    AS net_r
 		FROM backtest_trades
@@ -53,17 +63,23 @@ func LoadWeights(ctx context.Context, pool *pgxpool.Pool, runID int64) ([]Strate
 	var out []StrategyWeight
 	for rows.Next() {
 		var sw StrategyWeight
-		if err := rows.Scan(&sw.Strategy, &sw.Trades, &sw.Expectancy, &sw.WinRate, &sw.NetR); err != nil {
+		if err := rows.Scan(&sw.Strategy, &sw.Trades, &sw.Expectancy, &sw.StdDev, &sw.WinRate, &sw.NetR); err != nil {
 			return nil, err
 		}
-		w := sw.Expectancy
-		if w < 0 {
-			w = 0
-		}
-		sw.Weight = w * math.Sqrt(float64(sw.Trades))
+		sw.Weight = sharpeWeight(sw.Expectancy, sw.StdDev, sw.Trades)
 		out = append(out, sw)
 	}
 	return out, rows.Err()
+}
+
+// sharpeWeight implements the variance-aware weight formula used by both
+// LoadWeights (SQL aggregation) and walkforward.go's in-memory equivalent.
+// Single source of truth — drift between the two would silently bias WFA.
+func sharpeWeight(expectancy, stddev float64, trades int) float64 {
+	if stddev <= 1e-9 || expectancy <= 0 || trades <= 0 {
+		return 0
+	}
+	return (expectancy / stddev) * math.Log(float64(trades+1))
 }
 
 // WeightMap converts a slice into a name → weight lookup for ComposeSignal.
@@ -250,11 +266,11 @@ func FormatWeights(ws []StrategyWeight) string {
 
 	var b strings.Builder
 	fmt.Fprintln(&b, "── Strategy Weights ─────────────────────────────────────────")
-	fmt.Fprintf(&b, "  %-18s  %-6s  %-8s  %-8s  %-8s  %-8s\n",
-		"Strategy", "Trades", "ExpR", "WinRate", "NetR", "Weight")
+	fmt.Fprintf(&b, "  %-18s  %-6s  %-8s  %-7s  %-8s  %-8s  %-8s\n",
+		"Strategy", "Trades", "ExpR", "σR", "WinRate", "NetR", "Weight")
 	for _, w := range cp {
-		fmt.Fprintf(&b, "  %-18s  %-6d  %+8.3f  %6.1f%%  %+8.2f  %8.3f\n",
-			w.Strategy, w.Trades, w.Expectancy, w.WinRate*100, w.NetR, w.Weight)
+		fmt.Fprintf(&b, "  %-18s  %-6d  %+8.3f  %7.3f  %6.1f%%  %+8.2f  %8.3f\n",
+			w.Strategy, w.Trades, w.Expectancy, w.StdDev, w.WinRate*100, w.NetR, w.Weight)
 	}
 	return b.String()
 }

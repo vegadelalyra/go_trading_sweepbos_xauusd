@@ -145,10 +145,10 @@ func sliceByTime(candles []Candle, from, to time.Time) []Candle {
 	return candles[lo:hi]
 }
 
-// computeWeights derives StrategyWeights from an in-memory trades slice. This
-// mirrors the SQL aggregation in LoadWeights so WFA windows do not need to
-// persist their IS run to Postgres. Formula stays in sync with meta.go:
-// max(0, expectancy) × sqrt(N). P1.2 will replace both call sites in one pass.
+// computeWeights derives StrategyWeights from an in-memory trades slice.
+// Mirrors the SQL aggregation in LoadWeights so WFA windows don't need to
+// persist their IS run to Postgres. Uses the same sharpeWeight helper as
+// LoadWeights — drift between the two would silently bias WFA results.
 func computeWeights(trades []Trade) []StrategyWeight {
 	byStrat := map[string][]Trade{}
 	for _, t := range trades {
@@ -156,6 +156,7 @@ func computeWeights(trades []Trade) []StrategyWeight {
 	}
 	out := make([]StrategyWeight, 0, len(byStrat))
 	for name, ts := range byStrat {
+		n := len(ts)
 		exp := 0.0
 		wins := 0
 		netR := 0.0
@@ -166,19 +167,25 @@ func computeWeights(trades []Trade) []StrategyWeight {
 				wins++
 			}
 		}
-		exp /= float64(len(ts))
-		w := exp
-		if w < 0 {
-			w = 0
+		exp /= float64(n)
+
+		// Population stddev — same convention as SharpeRatio in metrics.go
+		// and STDDEV_POP in the SQL aggregation.
+		sq := 0.0
+		for _, t := range ts {
+			d := t.R - exp
+			sq += d * d
 		}
-		w *= math.Sqrt(float64(len(ts)))
+		stddev := math.Sqrt(sq / float64(n))
+
 		out = append(out, StrategyWeight{
 			Strategy:   name,
-			Trades:     len(ts),
+			Trades:     n,
 			Expectancy: exp,
-			WinRate:    float64(wins) / float64(len(ts)),
+			StdDev:     stddev,
+			WinRate:    float64(wins) / float64(n),
 			NetR:       netR,
-			Weight:     w,
+			Weight:     sharpeWeight(exp, stddev, n),
 		})
 	}
 	return out
