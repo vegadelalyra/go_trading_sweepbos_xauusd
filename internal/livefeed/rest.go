@@ -103,6 +103,8 @@ func FetchLatest(ctx context.Context, httpc *http.Client, apiKey, symbol, interv
 
 func restInterval(interval string) string {
 	switch interval {
+	case "5m":
+		return "5min"
 	case "15m":
 		return "15min"
 	case "1h":

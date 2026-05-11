@@ -959,6 +959,8 @@ func runPaperLive(args []string) int {
 // user knows whether their TD quota is at risk.
 func callsPerDay(interval string) int {
 	switch interval {
+	case "5m":
+		return 24 * 12 // 288 — fits under TD free-tier's 800/day
 	case "15m":
 		return 24 * 4 // 96
 	case "1h":
@@ -998,6 +1000,7 @@ func runCapitalSim(args []string) int {
 	reloadThresh := fs.Float64("reload-threshold", 10, "capital below this triggers a reload")
 	reloadAmt := fs.Float64("reload-amount", 200, "USD the capital is set to on reload")
 	minTrades := fs.Int("min-trades", 30, "skip strategies whose total trade count is below this (noise filter)")
+	strategyFilter := fs.String("strategy", "", "if set, simulate ONLY trades from this strategy (works with any source flag)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -1088,10 +1091,30 @@ func runCapitalSim(args []string) int {
 		cfg.StartCapital, cfg.FirstRiskPct*100, cfg.MartingaleRiskPct*100,
 		cfg.MaxTradesPerDay, cfg.ReloadThreshold, cfg.ReloadAmount)
 
+	// Optional per-strategy filter — narrows any source down to one
+	// strategy's trades. Useful when you want to know what e.g. OBM
+	// alone would produce on the WFA OOS curve (where it's the
+	// dominant honest contributor).
+	if *strategyFilter != "" {
+		filtered := map[string][]core.Trade{}
+		for name, ts := range groups {
+			var keep []core.Trade
+			for _, t := range ts {
+				if t.Strategy == *strategyFilter {
+					keep = append(keep, t)
+				}
+			}
+			if len(keep) > 0 {
+				filtered[name+" / "+*strategyFilter] = keep
+			}
+		}
+		groups = filtered
+	}
+
 	// Run sim per group, collect.
 	results := make([]capital.Result, 0, len(groups))
 	for name, ts := range groups {
-		if !oneShot && len(ts) < *minTrades {
+		if !oneShot && *strategyFilter == "" && len(ts) < *minTrades {
 			continue
 		}
 		results = append(results, capital.Simulate(name, ts, cfg))

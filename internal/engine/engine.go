@@ -73,6 +73,13 @@ func DefaultParams() BacktestParams {
 func ParamsFor(interval string) BacktestParams {
 	p := DefaultParams()
 	switch interval {
+	case "5m":
+		// XAU/USD 5m typical 1-3 dollar moves → tighter MaxSLPoints than
+		// 15m. Cooldown stays 4 candles (20min) which is short enough that
+		// the strategy can re-enter on the next setup but long enough to
+		// avoid re-firing on the same chop.
+		p.MaxSLPoints = 30
+		p.MaxHoldCandles = 0
 	case "15m":
 		p.MaxSLPoints = 50
 		p.MaxHoldCandles = 0

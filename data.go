@@ -31,9 +31,11 @@ type tdResponse struct {
 	} `json:"values"`
 }
 
-// tdInterval converts internal interval labels ("15m","1h","4h") to TwelveData's.
+// tdInterval converts internal interval labels ("5m","15m","1h","4h") to TwelveData's.
 func tdInterval(interval string) string {
 	switch interval {
+	case "5m":
+		return "5min"
 	case "15m":
 		return "15min"
 	case "1h":

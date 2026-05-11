@@ -275,6 +275,8 @@ func closedBarIndex(candles []core.Candle, intervalDur time.Duration, now time.T
 
 func intervalDuration(interval string) time.Duration {
 	switch interval {
+	case "5m":
+		return 5 * time.Minute
 	case "15m":
 		return 15 * time.Minute
 	case "1h":
