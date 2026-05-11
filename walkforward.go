@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/metrics"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/smc"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy"
 )
@@ -402,7 +403,7 @@ func summarizeWFAWindow(w *WFAWindow) {
 		if span >= 1 {
 			tradesPerYear = float64(len(w.OOSTrades)) * 365.0 / span
 		}
-		w.OOSSharpe = SharpeRatio(rs, tradesPerYear)
+		w.OOSSharpe = metrics.SharpeRatio(rs, tradesPerYear)
 	}
 }
 

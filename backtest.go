@@ -5,6 +5,7 @@ import (
 	"math"
 	"time"
 
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/metrics"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/smc"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy"
 )
@@ -390,12 +391,12 @@ func computeStats(trades []Trade, p BacktestParams, maxDDPct, endBal float64) Ba
 		}
 		s.DaysCovered = days
 		tradesPerYear := float64(len(trades)) * 365.0 / float64(days)
-		s.Sharpe = SharpeRatio(rs, tradesPerYear)
-		s.RecoveryFactor = RecoveryFactor(s.NetR, maxDDPct)
-		s.AnnualReturnPct = AnnualizedReturn(s.StartBalance, s.EndBalance, days)
-		s.Calmar = CalmarRatio(s.AnnualReturnPct, maxDDPct*100)
-		s.MaxLossStreak = MaxConsecutiveLosses(rs)
-		s.MaxWinStreak = MaxConsecutiveWins(rs)
+		s.Sharpe = metrics.SharpeRatio(rs, tradesPerYear)
+		s.RecoveryFactor = metrics.RecoveryFactor(s.NetR, maxDDPct)
+		s.AnnualReturnPct = metrics.AnnualizedReturn(s.StartBalance, s.EndBalance, days)
+		s.Calmar = metrics.CalmarRatio(s.AnnualReturnPct, maxDDPct*100)
+		s.MaxLossStreak = metrics.MaxConsecutiveLosses(rs)
+		s.MaxWinStreak = metrics.MaxConsecutiveWins(rs)
 	}
 	return s
 }

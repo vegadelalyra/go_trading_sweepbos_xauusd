@@ -1,4 +1,9 @@
-package main
+// Package metrics provides risk-adjusted return statistics shared by the
+// backtester, walk-forward analyser and bootstrap. Every function is pure
+// — no DB, no globals — so the same helpers compute the same numbers
+// whether the input is a stored run, a window's OOS slice, or a resampled
+// stream.
+package metrics
 
 import "math"
 

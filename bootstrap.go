@@ -8,6 +8,8 @@ import (
 	"sort"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/metrics"
 )
 
 // BootstrapResult holds the resampled distributions for each headline metric.
@@ -86,11 +88,11 @@ func StationaryBlockBootstrap(trades []Trade, iterations int, meanBlockLen, star
 		// instead of trades-per-year derived from the actual data. Each
 		// bootstrap pass therefore uses the same scaling, keeping the
 		// CI comparable across iterations.
-		sharpes[it] = SharpeRatio(rs, 252)
+		sharpes[it] = metrics.SharpeRatio(rs, 252)
 		maxDDs[it] = maxDD
 		netRs[it] = netR
 		annRet := (balance/startBalance - 1) * 100
-		calmars[it] = CalmarRatio(annRet, maxDD*100)
+		calmars[it] = metrics.CalmarRatio(annRet, maxDD*100)
 	}
 
 	br := BootstrapResult{Iterations: iterations, BlockMean: meanBlockLen}
