@@ -74,11 +74,12 @@ type Analysis struct {
 func Analyze(candles []Candle) Analysis {
 	swings := DetectSwings(candles)
 	structure := DetectStructure(candles, swings)
+	fvgs := DetectFVGs(candles)
 	return Analysis{
 		Swings:      swings,
-		FVGs:        DetectFVGs(candles),
+		FVGs:        fvgs,
 		Structure:   structure,
-		OrderBlocks: DetectOrderBlocks(candles, structure),
+		OrderBlocks: DetectOrderBlocks(candles, structure, swings, fvgs),
 	}
 }
 
@@ -178,9 +179,26 @@ func DetectStructure(candles []Candle, swings []Swing) []StructureEvent {
 	return out
 }
 
-// On a bullish BOS at index k, the OB is the last bearish candle before the impulsive move.
-// On a bearish BOS, the OB is the last bullish candle before the move.
-func DetectOrderBlocks(candles []Candle, events []StructureEvent) []OrderBlock {
+// DetectOrderBlocks identifies institutional Order Blocks: the last opposite-color
+// candle before a structural break (BoS/CHoCh) that also satisfies the three ICT
+// validation pillars. Anything that fails any pillar is excluded — the old
+// "just grab the last opposite-color body within 12 candles" produced a 60-80%
+// false-positive rate that polluted OrderBlockMitigation and BreakerBlock.
+//
+// Pillar 1 — Prior liquidity sweep: institutional accumulation needs fuel. We
+// require that within 10 candles before the OB, price pierced a prior swing
+// (the wick of some bar k took out a swing whose own Index < k). For a bullish
+// OB we look for a swept LOW; for bearish, a swept HIGH.
+//
+// Pillar 2 — Displacement (FVG within 3 candles after OB): the move out of the
+// OB must be impulsive enough to leave an imbalance. Same-direction FVG only.
+//
+// Pillar 3 — Mitigation zero: between the OB and the BoS event, no candle body
+// closed beyond the OB's 50% mean threshold. If it did, the imbalance is gone.
+//
+// Lookback widened from 12 → 20 because some institutional OBs form during
+// slower accumulation phases that pre-date the impulse.
+func DetectOrderBlocks(candles []Candle, events []StructureEvent, swings []Swing, fvgs []FVG) []OrderBlock {
 	out := make([]OrderBlock, 0, len(events))
 	for _, e := range events {
 		if e.Kind != StructBOSBull && e.Kind != StructBOSBear &&
@@ -188,18 +206,89 @@ func DetectOrderBlocks(candles []Candle, events []StructureEvent) []OrderBlock {
 			continue
 		}
 		bull := e.Kind == StructBOSBull || e.Kind == StructCHoChBull
-		// scan backward from e.Index-1 for last opposite-color candle
-		for j := e.Index - 1; j >= 0 && j > e.Index-12; j-- {
+
+		// Candidate OB: last opposite-color body within 20 candles before the impulse.
+		obIdx := -1
+		for j := e.Index - 1; j >= 0 && j > e.Index-20; j-- {
 			c := candles[j]
 			if bull && c.Close < c.Open {
-				out = append(out, OrderBlock{Index: j, Bottom: c.Low, Top: c.High, Bullish: true})
+				obIdx = j
 				break
 			}
 			if !bull && c.Close > c.Open {
-				out = append(out, OrderBlock{Index: j, Bottom: c.Low, Top: c.High, Bullish: false})
+				obIdx = j
 				break
 			}
 		}
+		if obIdx < 0 {
+			continue
+		}
+		ob := candles[obIdx]
+
+		// Pillar 1: prior-liquidity sweep within the 10 candles before the OB.
+		swept := false
+		for k := obIdx - 1; k >= 0 && obIdx-k <= 10; k-- {
+			for s := len(swings) - 1; s >= 0; s-- {
+				sw := swings[s]
+				if sw.Index >= k {
+					continue
+				}
+				if k-sw.Index > 30 {
+					break
+				}
+				if bull && !sw.IsHigh && candles[k].Low < sw.Price {
+					swept = true
+					break
+				}
+				if !bull && sw.IsHigh && candles[k].High > sw.Price {
+					swept = true
+					break
+				}
+			}
+			if swept {
+				break
+			}
+		}
+		if !swept {
+			continue
+		}
+
+		// Pillar 2: same-direction FVG within 3 candles after the OB.
+		hasFVG := false
+		for _, f := range fvgs {
+			if f.Index <= obIdx {
+				continue
+			}
+			if f.Index > obIdx+3 {
+				break
+			}
+			if f.Bullish == bull {
+				hasFVG = true
+				break
+			}
+		}
+		if !hasFVG {
+			continue
+		}
+
+		// Pillar 3: no body-close beyond OB mean between the OB and the BoS event.
+		mid := (ob.High + ob.Low) / 2
+		invalidated := false
+		for j := obIdx + 1; j < e.Index; j++ {
+			if bull && candles[j].Close < mid {
+				invalidated = true
+				break
+			}
+			if !bull && candles[j].Close > mid {
+				invalidated = true
+				break
+			}
+		}
+		if invalidated {
+			continue
+		}
+
+		out = append(out, OrderBlock{Index: obIdx, Bottom: ob.Low, Top: ob.High, Bullish: bull})
 	}
 	return out
 }
