@@ -95,8 +95,7 @@ FLAGS for `+"`import-cache`"+`
 ENVIRONMENT
   TWELVEDATA_API_KEY     required for live, historic, and backfill
   CANDLES_DSN            Postgres DSN; default:
-                         postgres://emy_admin:emy-1234@127.0.0.1:5432/candles?sslmode=disable
-`)
+                         postgres://emy_admin:emy-1234@127.0.0.1:5432/candles?sslmode=disable`)
 }
 
 func runTUI() int {
