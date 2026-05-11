@@ -150,6 +150,39 @@ func loadBacktestTrades(ctx context.Context, pool *pgxpool.Pool, runID int64) ([
 	return out, rows.Err()
 }
 
+// loadWFATrades pulls the concatenated OOS trades of a stored WFA run.
+// Ordered by entry_time so the geometric-block resampler sees the same
+// chronology the live system would. Same field surface as loadBacktestTrades
+// — only the source table differs.
+func loadWFATrades(ctx context.Context, pool *pgxpool.Pool, wfaRunID int64) ([]Trade, error) {
+	rows, err := pool.Query(ctx, `
+		SELECT strategy, side, r_realized, win, entry_time, exit_time
+		FROM wfa_trades
+		WHERE wfa_run_id = $1
+		ORDER BY entry_time ASC
+	`, wfaRunID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Trade
+	for rows.Next() {
+		var t Trade
+		var sideStr string
+		if err := rows.Scan(&t.Strategy, &sideStr, &t.R, &t.Win, &t.EntryTime, &t.ExitTime); err != nil {
+			return nil, err
+		}
+		if sideStr == "SHORT" {
+			t.Side = Short
+		} else {
+			t.Side = Long
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 // formatBootstrap renders a bootstrap result to the CLI.
 func formatBootstrap(br BootstrapResult, n int) string {
 	return fmt.Sprintf(

@@ -456,6 +456,7 @@ func runWFA(args []string) int {
 	pdLookback := fs.Int("pd-lookback", 0, "Premium/Discount filter lookback in candles (0 disables)")
 	slippage := fs.Float64("slippage", 0, "SL slippage in dollars (0 disables)")
 	slippageNewsMult := fs.Float64("slippage-news-mult", 1.0, "multiplier applied to slippage in news windows")
+	persist := fs.Bool("persist", false, "store this WFA run + every OOS trade in wfa_runs/wfa_trades")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -509,15 +510,29 @@ func runWFA(args []string) int {
 		s.Total, s.WinRate*100, s.NetR, pf, s.MaxDDPct*100, s.Sharpe, s.Calmar)
 	fmt.Printf("  Balance: $%.0f → $%.0f (%+.2f%%)\n",
 		s.StartBalance, s.EndBalance, (s.EndBalance-s.StartBalance)/s.StartBalance*100)
+
+	if *persist {
+		runID, err := SaveWFARun(ctx, pool, cfg, res)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "persist: %v\n", err)
+			return 1
+		}
+		fmt.Printf("\nPersisted as wfa_runs.id=%d with %d trades\n", runID, len(res.CombinedTrades))
+	}
 	return 0
 }
 
 func runBootstrap(args []string) int {
 	fs := flag.NewFlagSet("bootstrap", flag.ContinueOnError)
-	runID := fs.Int64("run-id", 0, "backtest_runs.id to bootstrap (0 = latest)")
+	runID := fs.Int64("run-id", 0, "backtest_runs.id to bootstrap (0 = latest plain run, mutually exclusive with -wfa-run)")
+	wfaRunID := fs.Int64("wfa-run", 0, "wfa_runs.id to bootstrap (operates on the concatenated OOS curve)")
 	iterations := fs.Int("iterations", 5000, "bootstrap iterations (≥5000 recommended for stable tails)")
 	blockLen := fs.Float64("block", 40, "expected block length in trades (geometric distribution)")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *runID != 0 && *wfaRunID != 0 {
+		fmt.Fprintln(os.Stderr, "-run-id and -wfa-run are mutually exclusive")
 		return 2
 	}
 
@@ -529,18 +544,31 @@ func runBootstrap(args []string) int {
 	}
 	defer pool.Close()
 
-	id := *runID
-	if id == 0 {
-		if err := pool.QueryRow(ctx, `SELECT id FROM backtest_runs ORDER BY id DESC LIMIT 1`).Scan(&id); err != nil {
-			fmt.Fprintf(os.Stderr, "find latest run: %v\n", err)
+	var (
+		trades []Trade
+		header string
+	)
+	if *wfaRunID != 0 {
+		trades, err = loadWFATrades(ctx, pool, *wfaRunID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load wfa trades: %v\n", err)
 			return 1
 		}
-	}
-
-	trades, err := loadBacktestTrades(ctx, pool, id)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "load trades: %v\n", err)
-		return 1
+		header = fmt.Sprintf("Bootstrap — wfa_runs.id=%d (OOS curve)", *wfaRunID)
+	} else {
+		id := *runID
+		if id == 0 {
+			if err := pool.QueryRow(ctx, `SELECT id FROM backtest_runs ORDER BY id DESC LIMIT 1`).Scan(&id); err != nil {
+				fmt.Fprintf(os.Stderr, "find latest run: %v\n", err)
+				return 1
+			}
+		}
+		trades, err = loadBacktestTrades(ctx, pool, id)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load trades: %v\n", err)
+			return 1
+		}
+		header = fmt.Sprintf("Bootstrap — backtest_runs.id=%d", id)
 	}
 	if len(trades) < 30 {
 		fmt.Fprintf(os.Stderr, "only %d trades available — need at least 30 for the bootstrap to be meaningful\n", len(trades))
@@ -548,7 +576,7 @@ func runBootstrap(args []string) int {
 	}
 
 	br := StationaryBlockBootstrap(trades, *iterations, *blockLen, DefaultParams().StartBalance, DefaultParams().RiskPct)
-	fmt.Printf("\n═══ Bootstrap — backtest_runs.id=%d ═══\n", id)
+	fmt.Printf("\n═══ %s ═══\n", header)
 	fmt.Print(formatBootstrap(br, len(trades)))
 	return 0
 }

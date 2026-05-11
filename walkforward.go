@@ -7,6 +7,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/smc"
@@ -427,4 +428,102 @@ func combinedStats(trades []Trade, p BacktestParams) BacktestStats {
 		}
 	}
 	return computeStats(trades, p, maxDD, balance)
+}
+
+// SaveWFARun persists a WFA result to wfa_runs + wfa_trades atomically.
+// Returns the new wfa_runs.id. Every OOS trade across every window is
+// stored with its 1-based window_idx so downstream consumers (bootstrap,
+// reports) can keep per-window analysis even after the in-memory result
+// is gone.
+//
+// Why a dedicated table instead of reusing backtest_runs: a backtest run
+// is one IS or one plain run; a WFA run is a sequence of IS→OOS pairs
+// whose only externally meaningful curve is the concatenated OOS stream.
+// Forcing it into backtest_runs would either lose the windowing or pollute
+// the table with rows that callers can't tell apart.
+func SaveWFARun(ctx context.Context, pool *pgxpool.Pool, cfg WFAConfig, res WFAResult) (int64, error) {
+	if len(res.Windows) == 0 {
+		return 0, fmt.Errorf("no WFA windows to persist")
+	}
+	statsJSON, err := jsonMarshal(res.CombinedStats)
+	if err != nil {
+		return 0, fmt.Errorf("marshal stats: %w", err)
+	}
+	startedAt := res.Windows[0].ISStart
+	endedAt := res.Windows[len(res.Windows)-1].OOSEnd
+
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+
+	var runID int64
+	err = tx.QueryRow(ctx, `
+		INSERT INTO wfa_runs (
+			symbol, interval, started_at, ended_at,
+			is_months, oos_months, step_months,
+			threshold, use_bias, atr_mult, pd_lookback,
+			slippage_points, slippage_news_mult, h4_period,
+			windows_count, stats
+		) VALUES (
+			$1, $2, $3, $4,
+			$5, $6, $7,
+			$8, $9, $10, $11,
+			$12, $13, $14,
+			$15, $16
+		) RETURNING id`,
+		cfg.Symbol, cfg.Interval, startedAt.UTC(), endedAt.UTC(),
+		cfg.ISWindowMonths, cfg.OOSWindowMonths, cfg.StepMonths,
+		cfg.Threshold, cfg.UseBias, cfg.ATRMult, cfg.PDLookback,
+		cfg.Slippage, cfg.SlippageNewsMult, cfg.H4Period,
+		res.WindowsCount, statsJSON,
+	).Scan(&runID)
+	if err != nil {
+		return 0, fmt.Errorf("insert wfa_run: %w", err)
+	}
+
+	totalTrades := 0
+	for _, w := range res.Windows {
+		totalTrades += len(w.OOSTrades)
+	}
+	if totalTrades == 0 {
+		if err := tx.Commit(ctx); err != nil {
+			return 0, err
+		}
+		return runID, nil
+	}
+
+	rows := make([][]any, 0, totalTrades)
+	for wi, w := range res.Windows {
+		for _, t := range w.OOSTrades {
+			rows = append(rows, []any{
+				runID, wi + 1, t.Strategy, t.Side.String(),
+				t.EntryIdx, t.ExitIdx,
+				t.EntryTime.UTC(), t.ExitTime.UTC(),
+				t.Entry, t.SL, t.TP, t.ExitPrice,
+				t.R, t.Win, t.CandlesToExit,
+				t.Session, t.YearMonth, t.YearQuarter,
+				t.BalanceAfter,
+			})
+		}
+	}
+	_, err = tx.CopyFrom(ctx, pgx.Identifier{"wfa_trades"},
+		[]string{
+			"wfa_run_id", "window_idx", "strategy", "side",
+			"entry_idx", "exit_idx",
+			"entry_time", "exit_time",
+			"entry_price", "sl", "tp", "exit_price",
+			"r_realized", "win", "candles_to_exit",
+			"session", "year_month", "year_quarter",
+			"balance_after",
+		}, pgx.CopyFromRows(rows))
+	if err != nil {
+		return 0, fmt.Errorf("copy wfa_trades: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return runID, nil
 }
