@@ -1111,6 +1111,9 @@ func runCapitalSim(args []string) int {
 	minTrades := fs.Int("min-trades", 30, "skip strategies whose total trade count is below this (noise filter)")
 	strategyFilter := fs.String("strategy", "", "if set, simulate ONLY trades from this strategy (works with any source flag)")
 	tiersFlag := fs.String("tiers", "", "capital-band tiers \"threshold:risk[,threshold:risk]...\" — e.g. \"100000:0.1925,1000000:0.0963\" steps down to Half/Quarter Kelly at $100k/$1M")
+	autocorrOn := fs.Bool("autocorr", false, "enable autocorr-aware Kelly: scale risk by (1 − λ·max(0,ρ_1)) where ρ_1 is the lag-1 autocorr of recent R-multiples (clustering of losses cuts size)")
+	autocorrWin := fs.Int("autocorr-window", 20, "size of the rolling R-window used to estimate ρ_1 (penalty stays off until this many trades have closed)")
+	autocorrLam := fs.Float64("autocorr-lambda", 1.5, "autocorr-aware Kelly penalty aggressiveness λ (higher = more shrinkage when ρ_1>0; ρ_1≥1/λ clamps risk to 0)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -1152,6 +1155,9 @@ func runCapitalSim(args []string) int {
 		ReloadThreshold:   *reloadThresh,
 		ReloadAmount:      *reloadAmt,
 		Tiers:             tiers,
+		AutocorrEnabled:   *autocorrOn,
+		AutocorrWindow:    *autocorrWin,
+		AutocorrLambda:    *autocorrLam,
 	}
 
 	// Decide the trade source.

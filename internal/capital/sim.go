@@ -69,6 +69,56 @@ type Config struct {
 	// tier's FirstRiskPct / MartingaleRiskPct in place of the base.
 	// MaxTradesPerDay=0 in a tier inherits the base setting.
 	Tiers []Tier
+
+	// AutocorrEnabled toggles the autocorr-aware Kelly penalty. The
+	// classical Kelly formula assumes i.i.d. trades, but real intraday
+	// losses cluster in volatility regimes — a fresh SL is conditionally
+	// likelier when recent SLs were also SLs. When this is true and the
+	// rolling window has filled (≥ AutocorrWindow closed trades), risk
+	// is scaled down by  (1 - λ · max(0, ρ_1))  where ρ_1 is the lag-1
+	// population autocorrelation of recent R-multiples. Default: OFF;
+	// callers must opt in explicitly so legacy results stay reproducible.
+	AutocorrEnabled bool
+	// AutocorrWindow is the size of the rolling R-stream used to estimate
+	// ρ_1. Below this count of CLOSED trades, no penalty is applied
+	// (autocorr on tiny samples is statistical noise). Default 20.
+	AutocorrWindow int
+	// AutocorrLambda controls how aggressively positive autocorrelation
+	// shrinks the size. λ=1.5 means ρ_1=0.5 cuts risk by 75% (1-1.5·0.5=0.25);
+	// ρ_1≥1/λ clamps execution risk at zero. Default 1.5.
+	AutocorrLambda float64
+}
+
+// lag1Autocorr computes the lag-1 population autocorrelation of the R
+// stream rs. Returns 0 when n<2 or when the population variance is
+// non-positive (degenerate stream — every R identical). The formula uses
+// POPULATION (÷n) rather than sample (÷(n-1)) variance so that ρ_1
+// remains bounded in [-1, 1] and matches the textbook autocovariance
+// definition.
+func lag1Autocorr(rs []float64) float64 {
+	n := len(rs)
+	if n < 2 {
+		return 0
+	}
+	var sum float64
+	for _, r := range rs {
+		sum += r
+	}
+	mean := sum / float64(n)
+	var variance, covariance float64
+	for i, r := range rs {
+		d := r - mean
+		variance += d * d
+		if i < n-1 {
+			covariance += d * (rs[i+1] - mean)
+		}
+	}
+	variance /= float64(n)
+	covariance /= float64(n)
+	if variance <= 0 {
+		return 0
+	}
+	return covariance / variance
 }
 
 // pickTier returns the active tier for `capital` (highest Threshold ≤
@@ -161,6 +211,46 @@ func Simulate(strategyName string, trades []core.Trade, cfg Config) Result {
 	capital := cfg.StartCapital
 	res.Peak = capital
 
+	// Autocorr setup. When disabled or misconfigured we skip the rolling
+	// buffer entirely (window<2 would yield ρ_1=0 anyway, but bypassing
+	// the bookkeeping keeps the legacy path bit-for-bit identical).
+	autocorrOn := cfg.AutocorrEnabled && cfg.AutocorrWindow >= 2
+	autocorrWindow := cfg.AutocorrWindow
+	autocorrLambda := cfg.AutocorrLambda
+	var rBuf []float64
+	if autocorrOn {
+		rBuf = make([]float64, 0, autocorrWindow)
+	}
+	// scaleFactor is the (1 - λ·max(0,ρ_1)) multiplier applied to risk on
+	// THIS trade. Only meaningful when the rolling window has filled;
+	// before then we treat the autocorr estimate as too noisy to act on.
+	scaleFactor := func() float64 {
+		if !autocorrOn || len(rBuf) < autocorrWindow {
+			return 1.0
+		}
+		rho := lag1Autocorr(rBuf)
+		if rho <= 0 {
+			return 1.0
+		}
+		f := 1.0 - autocorrLambda*rho
+		if f < 0 {
+			f = 0
+		}
+		return f
+	}
+	pushR := func(r float64) {
+		if !autocorrOn {
+			return
+		}
+		if len(rBuf) < autocorrWindow {
+			rBuf = append(rBuf, r)
+			return
+		}
+		// Slide left by one and append the newest R at the tail.
+		copy(rBuf, rBuf[1:])
+		rBuf[len(rBuf)-1] = r
+	}
+
 	var (
 		currentDay   time.Time
 		dayUsed      int  // 0=untouched, 1=first taken, 2=martingale taken
@@ -221,16 +311,22 @@ func Simulate(strategyName string, trades []core.Trade, cfg Config) Result {
 			}
 		}
 
+		// Autocorr-aware Kelly: multiply the tier's risk fraction by
+		// (1 - λ · max(0, ρ_1)). When the rolling window is short or
+		// autocorr is OFF, scale is exactly 1.0 (legacy behavior).
+		scale := scaleFactor()
+
 		switch dayUsed {
 		case 0:
 			// First (and possibly only) trade of the day. Risk is
 			// computed against THIS day's starting capital.
-			risk := firstRisk * prevDayStart
+			risk := firstRisk * scale * prevDayStart
 			capital += t.R * risk
 			dayUsed = 1
 			freeAt = t.ExitTime
 			martingaleOK = !t.Win
 			res.DaysWithTrades++
+			pushR(t.R)
 
 		case 1:
 			// Martingale slot — only if the first lost AND user opted in.
@@ -241,12 +337,13 @@ func Simulate(strategyName string, trades []core.Trade, cfg Config) Result {
 			if !martingaleOK || maxTrades < 2 || martRisk <= 0 {
 				continue
 			}
-			risk := martRisk * prevDayStart
+			risk := martRisk * scale * prevDayStart
 			capital += t.R * risk
 			dayUsed = 2
 			freeAt = t.ExitTime
 			martingaleOK = false
 			res.DaysWithMartingale++
+			pushR(t.R)
 
 		default:
 			// Day's quota used; skip every remaining trade on this day.
