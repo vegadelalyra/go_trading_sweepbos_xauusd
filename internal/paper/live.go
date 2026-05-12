@@ -84,11 +84,31 @@ func RunLive(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig,
 
 	params := buildLiveParams(cfg)
 
+	intervalDur := intervalDuration(cfg.Interval)
+	if intervalDur <= 0 {
+		return 0, fmt.Errorf("unsupported interval %q", cfg.Interval)
+	}
+
+	// Compose function is closed over the weight table chosen at startup.
+	// Re-evaluating weights every poll is overkill — the underlying
+	// LoadWeights call hits Postgres; we'd just be re-deriving the same
+	// numbers. Built early so replayMissedSignals can reuse it and warm
+	// the dynamic-threshold buffer with historical NetWeights.
+	compose := buildComposer(cfg, weights, weightsBySession)
+
+	// Replay any ENTRY-tier signals (|net|≥2.0) that closed since the last
+	// graceful shutdown, capped at 24h. Runs BEFORE createLiveRun so the
+	// query naturally sees only prior runs. Fetch-on-startup keeps the
+	// digest accurate even if `backfill` hasn't been run recently.
+	startupNow := time.Now().UTC()
+	if err := replayMissedSignals(ctx, pool, cfg, compose, params, intervalDur, startupNow, log); err != nil {
+		log.Log("replay error: %v — continuing", err)
+	}
+
 	// Persist a paper_runs row up-front. ended_at gets bumped to "now" on
 	// graceful shutdown; if the script crashes, ended_at stays at the
 	// startup time and the run is still queryable.
-	now := time.Now().UTC()
-	paperRunID, err := createLiveRun(ctx, pool, cfg, now)
+	paperRunID, err := createLiveRun(ctx, pool, cfg, startupNow)
 	if err != nil {
 		return 0, fmt.Errorf("create live run: %w", err)
 	}
@@ -98,18 +118,6 @@ func RunLive(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig,
 	}
 	log.Log("paper_runs.id=%d created (live mode, source backtest_runs.id=%d, bySession=%t, %s)",
 		paperRunID, cfg.SourceRunID, cfg.BySession, gateLabel)
-
-	// Compose function is closed over the weight table chosen at startup.
-	// Re-evaluating weights every poll is overkill — the underlying
-	// LoadWeights call hits Postgres; we'd just be re-deriving the same
-	// numbers. If the user wants to incorporate accumulating paper trades
-	// they restart the script (or we add a periodic re-derive later).
-	compose := buildComposer(cfg, weights, weightsBySession)
-
-	intervalDur := intervalDuration(cfg.Interval)
-	if intervalDur <= 0 {
-		return paperRunID, fmt.Errorf("unsupported interval %q", cfg.Interval)
-	}
 
 	// Track the last bar-time we issued a signal on, so we don't re-signal
 	// the same bar on a redundant poll. Restart-safe: read from DB so a
@@ -497,6 +505,118 @@ func loadLastSignalledTime(ctx context.Context, pool *pgxpool.Pool, paperRunID i
 		return time.Time{}, err
 	}
 	return *t, nil
+}
+
+// replayMissedSignals scans for ENTRY-tier signals (|NetWeight| ≥ 2.0)
+// that closed in the window [last_paper_run.ended_at, now], capped at
+// the most recent 24h. Emits one MISSED log line per match without
+// touching paper_pending — purely informational so the operator sees
+// what fired while the script was offline. Also warms the dynamic
+// threshold buffer via the shared compose closure.
+const (
+	replayMaxWindow    = 24 * time.Hour
+	replayEntryNetAbs  = 2.0
+	replayFetchPadding = 10
+)
+
+func replayMissedSignals(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig,
+	compose func([]core.Candle, smc.Analysis, int) meta.CompositeSignal,
+	params engine.BacktestParams, intervalDur time.Duration, now time.Time, log Logger) error {
+
+	var lastEnded *time.Time
+	err := pool.QueryRow(ctx, `
+		SELECT MAX(ended_at) FROM paper_runs
+		WHERE symbol = $1 AND interval = $2 AND is_live = true`,
+		cfg.Symbol, cfg.Interval).Scan(&lastEnded)
+	if err != nil {
+		return fmt.Errorf("query last paper_run: %w", err)
+	}
+	if lastEnded == nil {
+		log.Log("replay: no prior paper_runs for %s %s — skipping missed-signal digest", cfg.Symbol, cfg.Interval)
+		return nil
+	}
+
+	gap := now.Sub(*lastEnded)
+	if gap <= intervalDur {
+		log.Log("replay: gap %s ≤ interval %s — nothing to replay", gap.Round(time.Second), intervalDur)
+		return nil
+	}
+	capped := false
+	if gap > replayMaxWindow {
+		gap = replayMaxWindow
+		capped = true
+	}
+	fromTime := now.Add(-gap)
+	if fromTime.Before(*lastEnded) {
+		fromTime = *lastEnded
+	}
+	if capped {
+		log.Log("replay: scanning ENTRY signals (|net|≥%.1f) %s → %s (24h cap; last ended_at=%s)",
+			replayEntryNetAbs,
+			fromTime.Format("2006-01-02 15:04 UTC"), now.Format("2006-01-02 15:04 UTC"),
+			lastEnded.Format("2006-01-02 15:04 UTC"))
+	} else {
+		log.Log("replay: scanning ENTRY signals (|net|≥%.1f) %s → %s (gap %s)",
+			replayEntryNetAbs,
+			fromTime.Format("2006-01-02 15:04 UTC"), now.Format("2006-01-02 15:04 UTC"),
+			gap.Round(time.Minute))
+	}
+
+	// Fetch enough closed candles from TwelveData to cover the gap, plus a
+	// small padding for safety. Free tier allows up to 5000 per request, so
+	// even a 24h 5m window (288 bars) is one call.
+	barsNeeded := int(gap/intervalDur) + replayFetchPadding
+	fetched, err := livefeed.FetchLatest(ctx, cfg.HTTPClient, cfg.APIKey, cfg.Symbol, cfg.Interval, barsNeeded)
+	if err != nil {
+		log.Log("replay: fetch error: %v — falling back to DB-only candles", err)
+	} else if len(fetched) > 0 {
+		if _, err := upsertOHLC(ctx, pool, cfg.Symbol, cfg.Interval, fetched); err != nil {
+			log.Log("replay: upsert error: %v", err)
+		}
+	}
+
+	candles, err := loadAllCandles(ctx, pool, cfg.Symbol, cfg.Interval)
+	if err != nil {
+		return fmt.Errorf("load candles: %w", err)
+	}
+	if len(candles) < params.MinIndex+1 {
+		log.Log("replay: only %d candles available — need %d, skipping replay", len(candles), params.MinIndex+1)
+		return nil
+	}
+
+	lastClosedIdx := closedBarIndex(candles, intervalDur, now)
+	if lastClosedIdx < 0 {
+		log.Log("replay: no closed bars available")
+		return nil
+	}
+
+	a := smc.Analyze(candles)
+	found := 0
+	for i := params.MinIndex; i <= lastClosedIdx; i++ {
+		bt := candles[i].Time
+		if !bt.After(fromTime) {
+			continue
+		}
+		cs := compose(candles, a, i)
+		if math.Abs(cs.NetWeight) < replayEntryNetAbs {
+			continue
+		}
+		strat := cs.WinnerStrategy
+		if strat == "" {
+			strat = "Composite"
+		}
+		log.Log("MISSED  %s  %s %s  net=%+.2f  vote=%.2f  close=$%.2f  entry=%.2f  SL=%.2f  TP=%.2f",
+			bt.Format("2006-01-02 15:04 UTC"), cs.Side.String(), strat,
+			cs.NetWeight, cs.AppliedThreshold, candles[i].Close,
+			cs.BestEntry, cs.BestSL, cs.BestTP)
+		found++
+	}
+	if found == 0 {
+		log.Log("replay: no ENTRY-tier signals in window")
+	} else {
+		log.Log("replay: %d missed ENTRY signal(s) since last shutdown", found)
+	}
+	return nil
 }
 
 func upsertOHLC(ctx context.Context, pool *pgxpool.Pool, symbol, interval string, candles []core.Candle) (int, error) {
