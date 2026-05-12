@@ -44,16 +44,14 @@ type LiveConfig struct {
 	// paper-live run stays bit-for-bit identical until London Fix is opted in.
 	LondonFix meta.LondonFixConfig
 	// COMEXPin toggles the 48h COMEX pre-expiry pinning adjustment (Phase
-	// 3.2) at vote time. Zero-value (Enabled=false) is a no-op — every
-	// legacy paper-live run stays bit-for-bit identical until COMEX is
-	// opted in. See meta.COMEXPinConfig for the microstructural rationale.
+	// 3.2) at vote time. Zero-value (Enabled=false) is a no-op.
 	COMEXPin meta.COMEXPinConfig
 	// SpreadCurve toggles the synthetic intraday spread curve + spike
-	// filter (Phase 4.1+4.2). When Enabled, the engine sees a time-of-day
-	// spread instead of the constant SpreadDollar, and the spread-spike
-	// filter rejects signals during modelled blow-outs. Zero-value is a
-	// strict no-op.
+	// filter (Phase 4.1+4.2). Zero-value (Enabled=false) is a no-op.
 	SpreadCurve engine.SpreadCurveConfig
+	// DXY (Phase 3.3) is the intermarket-divergence weight adjustment.
+	// Zero-value (Enabled=false) is a no-op.
+	DXY meta.DXYFilterConfig
 }
 
 // pendingPosition mirrors a paper_pending row for in-memory grading. We
@@ -267,22 +265,26 @@ func buildComposer(cfg LiveConfig, weights map[string]float64, weightsBySession 
 	if cfg.ThresholdPercentile > 0 {
 		buf = meta.NewThresholdBuffer(meta.DefaultThresholdBufferCap)
 	}
+	// The DXY pointer is captured into the closure so its lazy structure
+	// cache survives across polls (same rationale as buf above). Caller
+	// must keep cfg alive across the loop.
+	dxy := &cfg.DXY
 	switch {
 	case cfg.BySession && buf != nil:
 		return func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
-			return meta.ComposeSignalBySessionDynamic(c, a, i, weightsBySession, cfg.ThresholdPercentile, buf, cfg.LondonFix, cfg.COMEXPin)
+			return meta.ComposeSignalBySessionDynamic(c, a, i, weightsBySession, cfg.ThresholdPercentile, buf, cfg.LondonFix, cfg.COMEXPin, dxy)
 		}
 	case cfg.BySession:
 		return func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
-			return meta.ComposeSignalBySession(c, a, i, weightsBySession, cfg.Threshold, cfg.LondonFix, cfg.COMEXPin)
+			return meta.ComposeSignalBySession(c, a, i, weightsBySession, cfg.Threshold, cfg.LondonFix, cfg.COMEXPin, dxy)
 		}
 	case buf != nil:
 		return func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
-			return meta.ComposeSignalDynamic(c, a, i, weights, cfg.ThresholdPercentile, buf, cfg.LondonFix, cfg.COMEXPin)
+			return meta.ComposeSignalDynamic(c, a, i, weights, cfg.ThresholdPercentile, buf, cfg.LondonFix, cfg.COMEXPin, dxy)
 		}
 	default:
 		return func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
-			return meta.ComposeSignal(c, a, i, weights, cfg.Threshold, cfg.LondonFix, cfg.COMEXPin)
+			return meta.ComposeSignal(c, a, i, weights, cfg.Threshold, cfg.LondonFix, cfg.COMEXPin, dxy)
 		}
 	}
 }

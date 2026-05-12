@@ -458,6 +458,41 @@ func buildCOMEXPinConfig(enabled bool, preHours int, momMult, fadeMult float64) 
 	}, nil
 }
 
+// buildDXYFilterConfig assembles a meta.DXYFilterConfig from the
+// per-subcommand CLI flags. When `enabled` is false the helper returns
+// the zero-value (no-op). When true it loads DXYCandles from the ohlc
+// table at the same interval as the XAU run.
+func buildDXYFilterConfig(ctx context.Context, pool *pgxpool.Pool, enabled bool, symbol, interval string, lookback int, confluentMult, opposingMult float64) (meta.DXYFilterConfig, error) {
+	if !enabled {
+		return meta.DXYFilterConfig{}, nil
+	}
+	if lookback <= 0 {
+		return meta.DXYFilterConfig{}, fmt.Errorf("-dxy-lookback must be > 0")
+	}
+	if confluentMult < 0 || opposingMult < 0 {
+		return meta.DXYFilterConfig{}, fmt.Errorf("-dxy-confluent-mult / -dxy-opposing-mult must be >= 0")
+	}
+	candles, err := loadCandles(ctx, pool, symbol, interval, time.Time{}, time.Time{})
+	if err != nil {
+		return meta.DXYFilterConfig{}, fmt.Errorf("load DXY candles (%s %s): %w", symbol, interval, err)
+	}
+	if len(candles) == 0 {
+		return meta.DXYFilterConfig{}, fmt.Errorf("DXY backfill is empty for %s %s — run `backfill -symbol=%s -interval=%s` first", symbol, interval, symbol, interval)
+	}
+	fmt.Printf("DXY filter ON  proxy=%s interval=%s candles=%d range=%s→%s  lookback=%d  confluent×%.2f  opposing×%.2f\n",
+		symbol, interval, len(candles),
+		candles[0].Time.Format("2006-01-02"),
+		candles[len(candles)-1].Time.Format("2006-01-02"),
+		lookback, confluentMult, opposingMult)
+	return meta.DXYFilterConfig{
+		Enabled:       true,
+		LookbackBars:  lookback,
+		ConfluentMult: confluentMult,
+		OpposingMult:  opposingMult,
+		DXYCandles:    candles,
+	}, nil
+}
+
 func runWeights(args []string) int {
 	fs := flag.NewFlagSet("weights", flag.ContinueOnError)
 	runID := fs.Int64("run-id", 0, "backtest_runs.id to source weights from (0 = latest)")
@@ -566,12 +601,11 @@ func runSignal(args []string) int {
 		}
 		if buf != nil {
 			compose = func(i int) meta.CompositeSignal {
-				return meta.ComposeSignalBySessionDynamic(candles, a, i, ws, *thresholdPct, buf, meta.LondonFixConfig{}, meta.COMEXPinConfig{})
+				return meta.ComposeSignalBySessionDynamic(candles, a, i, ws, *thresholdPct, buf, meta.LondonFixConfig{}, meta.COMEXPinConfig{}, nil)
 			}
 		} else {
 			compose = func(i int) meta.CompositeSignal {
-				return meta.ComposeSignalBySession(candles, a, i, ws, *threshold, meta.LondonFixConfig{}, meta.COMEXPinConfig{})
-			}
+				return meta.ComposeSignalBySession(candles, a, i, ws, *threshold, meta.LondonFixConfig{}, meta.COMEXPinConfig{}, nil)			}
 		}
 	} else {
 		ws, err := meta.LoadWeights(ctx, pool, id, paperRunIDs...)
@@ -582,12 +616,11 @@ func runSignal(args []string) int {
 		weights := meta.WeightMap(ws)
 		if buf != nil {
 			compose = func(i int) meta.CompositeSignal {
-				return meta.ComposeSignalDynamic(candles, a, i, weights, *thresholdPct, buf, meta.LondonFixConfig{}, meta.COMEXPinConfig{})
+				return meta.ComposeSignalDynamic(candles, a, i, weights, *thresholdPct, buf, meta.LondonFixConfig{}, meta.COMEXPinConfig{}, nil)
 			}
 		} else {
 			compose = func(i int) meta.CompositeSignal {
-				return meta.ComposeSignal(candles, a, i, weights, *threshold, meta.LondonFixConfig{}, meta.COMEXPinConfig{})
-			}
+				return meta.ComposeSignal(candles, a, i, weights, *threshold, meta.LondonFixConfig{}, meta.COMEXPinConfig{}, nil)			}
 		}
 	}
 
@@ -727,8 +760,7 @@ func runWFA(args []string) int {
 			fmt.Fprintln(os.Stderr, "comex_expiry is empty — apply schema/005_comex_expiry.sql first")
 			return 1
 		}
-		comexCfg.ExpiryDates = dates
-	}
+		comexCfg.ExpiryDates = dates	}
 
 	cfg := wfa.WFAConfig{
 		Symbol: *symbol, Interval: *interval,
@@ -750,8 +782,7 @@ func runWFA(args []string) int {
 		BayesShrink: *bayesShrink,
 		LondonFix:   lfCfg,
 		COMEXPin:    comexCfg,
-		SpreadCurve: spreadCfg,
-	}
+		SpreadCurve: spreadCfg,	}
 	candles, err := loadCandles(ctx, pool, cfg.Symbol, cfg.Interval, cfg.StartDate, cfg.EndDate)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load candles: %v\n", err)
@@ -784,8 +815,7 @@ func runWFA(args []string) int {
 	}
 	if comexCfg.Enabled {
 		fmt.Printf("  COMEX Pinning: ON  pre=%dh  momentum×%.2f  fade×%.2f  expiries=%d\n",
-			comexCfg.PreWindowHours, comexCfg.MomentumMult, comexCfg.FadeMult, len(comexCfg.ExpiryDates))
-	}
+			comexCfg.PreWindowHours, comexCfg.MomentumMult, comexCfg.FadeMult, len(comexCfg.ExpiryDates))	}
 	fmt.Println()
 	fmt.Printf("  %-3s  %-19s  %-19s  %-5s  %-7s  %-7s  %-7s\n",
 		"#", "OOS Start", "OOS End", "N", "WR%", "NetR", "Sharpe")
@@ -1302,8 +1332,7 @@ func runPaperLive(args []string) int {
 			fmt.Fprintln(os.Stderr, "comex_expiry is empty — apply schema/005_comex_expiry.sql first")
 			return 1
 		}
-		comexCfg.ExpiryDates = dates
-	}
+		comexCfg.ExpiryDates = dates	}
 
 	cfg := paper.LiveConfig{
 		SourceRunID: id, BySession: *bySession,
@@ -1318,8 +1347,7 @@ func runPaperLive(args []string) int {
 		HTTPClient:          &http.Client{Timeout: 30 * time.Second},
 		LondonFix:           lfCfg,
 		COMEXPin:            comexCfg,
-		SpreadCurve:         spreadCfg,
-	}
+		SpreadCurve:         spreadCfg,	}
 
 	fmt.Printf("═══ Paper Live — %s %s ═══\n", *symbol, *interval)
 	gate := fmt.Sprintf("threshold=%.2f", *threshold)
@@ -1337,8 +1365,7 @@ func runPaperLive(args []string) int {
 	}
 	if comexCfg.Enabled {
 		fmt.Printf("  COMEX Pinning: ON  pre=%dh  momentum×%.2f  fade×%.2f  expiries=%d\n",
-			comexCfg.PreWindowHours, comexCfg.MomentumMult, comexCfg.FadeMult, len(comexCfg.ExpiryDates))
-	}
+			comexCfg.PreWindowHours, comexCfg.MomentumMult, comexCfg.FadeMult, len(comexCfg.ExpiryDates))	}
 	if *pollSeconds > 0 {
 		fmt.Printf("  Poll cadence: every %ds (fixed)\n", *pollSeconds)
 	} else {

@@ -85,6 +85,12 @@ type WFAConfig struct {
 	// filter (Phase 4.1+4.2). Zero-value (Enabled=false) preserves the
 	// constant SpreadDollar everywhere. See engine.SpreadCurveConfig.
 	SpreadCurve engine.SpreadCurveConfig
+	// DXY (Phase 3.3) is the intermarket-divergence weight adjustment based
+	// on US Dollar Index structural posture. Zero-value (Enabled=false or
+	// empty DXYCandles) is a strict no-op. When enabled, DXYCandles must
+	// already be populated by the CLI loader before RunWFA is invoked —
+	// this package never touches the ohlc table.
+	DXY meta.DXYFilterConfig
 }
 
 // WFAWindow holds one IS→OOS slice plus the OOS-side performance.
@@ -186,11 +192,18 @@ func RunWFA(cfg WFAConfig, candles []core.Candle, h4Candles []core.Candle) (WFAR
 		if cfg.ThresholdPercentile > 0 {
 			buf = meta.NewThresholdBuffer(meta.DefaultThresholdBufferCap)
 		}
+		// DXY config is shared across the WFA's whole timeline — the
+		// structural-posture cache is keyed by DXY bar index and the
+		// same map of structures applies to every OOS window. We pass
+		// the address of cfg.DXY directly so the cache populated in
+		// window 1 is reused by windows 2..N (each window's bars look
+		// up DIFFERENT slots, so there's no cross-window state leakage).
+		dxy := &cfg.DXY
 		compose := func(c []core.Candle, a smc.Analysis, idx int) meta.CompositeSignal {
 			if buf != nil {
-				return meta.ComposeSignalDynamic(c, a, idx, weights, cfg.ThresholdPercentile, buf, cfg.LondonFix, cfg.COMEXPin)
+				return meta.ComposeSignalDynamic(c, a, idx, weights, cfg.ThresholdPercentile, buf, cfg.LondonFix, cfg.COMEXPin, dxy)
 			}
-			return meta.ComposeSignal(c, a, idx, weights, cfg.Threshold, cfg.LondonFix, cfg.COMEXPin)
+			return meta.ComposeSignal(c, a, idx, weights, cfg.Threshold, cfg.LondonFix, cfg.COMEXPin, dxy)
 		}
 		oosTrades := SimulateOOS(oosCandles, params, compose)
 
