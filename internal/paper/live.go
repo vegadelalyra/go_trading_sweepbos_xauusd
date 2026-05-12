@@ -205,6 +205,7 @@ func RunLive(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig,
 			log.Log("load pending error: %v", err)
 			continue
 		}
+		stillOpen := len(pending)
 		for _, pos := range pending {
 			tr, resolved := gradeOne(pos, candles, params)
 			if !resolved {
@@ -214,6 +215,7 @@ func RunLive(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig,
 				log.Log("close pending #%d error: %v", pos.ID, err)
 				continue
 			}
+			stillOpen--
 			result := "TP"
 			if !tr.Win {
 				result = "SL"
@@ -224,8 +226,8 @@ func RunLive(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig,
 			log.Log("RESOLVED #%d  %s  exit=$%.2f  R=%+.2f  held=%dc  (%s)",
 				pos.ID, result, tr.ExitPrice, tr.R, tr.ExitIdx-tr.EntryIdx, pos.Strategy)
 		}
-		if open := len(pending); open > 0 {
-			log.Log("pending=%d", open)
+		if stillOpen > 0 {
+			log.Log("pending=%d", stillOpen)
 		}
 	}
 }
