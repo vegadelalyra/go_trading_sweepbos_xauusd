@@ -15,6 +15,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 
@@ -1229,13 +1230,13 @@ func disableColorsIfNotTTY() {
 
 func runPaperLive(args []string) int {
 	fs := flag.NewFlagSet("paper-live", flag.ContinueOnError)
-	runID := fs.Int64("run-id", 0, "backtest_runs.id whose weights drive the live signals (0 = latest)")
+	runID := fs.Int64("run-id", 0, "backtest_runs.id whose weights drive the live signals (0 = latest canonical)")
 	paperRun := fs.String("paper-run", "", "comma-separated paper_runs.id list to UNION into the weight calc")
 	symbol := fs.String("symbol", "XAU/USD", "symbol to trade")
-	interval := fs.String("interval", "15m", "candle interval (15m/1h/4h)")
+	interval := fs.String("interval", "5m", "candle interval (5m/15m/1h/4h)")
 	threshold := fs.Float64("threshold", 2.0, "composite |NetWeight| threshold for an entry (ignored when -threshold-percentile > 0)")
-	thresholdPct := fs.Float64("threshold-percentile", 0, "if > 0, gate by the upper-tail percentile of the rolling |NetWeight| distribution; mutually exclusive with -threshold")
-	pdLookback := fs.Int("pd-lookback", 96, "Premium/Discount filter lookback in candles (0 disables, 96 = 24h on 15m)")
+	thresholdPct := fs.Float64("threshold-percentile", 0.95, "if > 0, gate by the upper-tail percentile of the rolling |NetWeight| distribution; mutually exclusive with -threshold")
+	pdLookback := fs.Int("pd-lookback", 288, "Premium/Discount filter lookback in candles (0 disables, 288 = 24h on 5m)")
 	slippage := fs.Float64("slippage", 0, "SL slippage in dollars (0 disables)")
 	slippageNewsMult := fs.Float64("slippage-news-mult", 1.0, "multiplier applied to slippage in news windows")
 	bySession := fs.Bool("by-session", false, "use per-session weight table instead of the global one")
@@ -1309,8 +1310,21 @@ func runPaperLive(args []string) int {
 
 	id := *runID
 	if id == 0 {
-		if err := pool.QueryRow(ctx, `SELECT id FROM backtest_runs ORDER BY id DESC LIMIT 1`).Scan(&id); err != nil {
-			fmt.Fprintf(os.Stderr, "find latest backtest run: %v\n", err)
+		// "latest canonical" so manual `backtest -persist` experiments don't
+		// silently hijack production. Schema 006 marks the seed (id=19) as
+		// canonical; the auto-refresh goroutine appends a new canonical row
+		// per market trading day.
+		err := pool.QueryRow(ctx, `
+			SELECT id FROM backtest_runs
+			WHERE symbol = $1 AND interval = $2 AND is_canonical = TRUE
+			ORDER BY created_at DESC, id DESC LIMIT 1`,
+			*symbol, *interval).Scan(&id)
+		if err == pgx.ErrNoRows {
+			fmt.Fprintf(os.Stderr, "no canonical backtest_runs row for %s %s — run `backtest -persist` first and `UPDATE backtest_runs SET is_canonical=true WHERE id=...`, or wait for the auto-refresh on next market day\n", *symbol, *interval)
+			return 1
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "find latest canonical run: %v\n", err)
 			return 1
 		}
 	}
