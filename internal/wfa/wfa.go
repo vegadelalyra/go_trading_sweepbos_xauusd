@@ -63,6 +63,14 @@ type WFAConfig struct {
 	// overlay passed through to the engine BacktestParams used inside
 	// each OOS window. Default zero-value disables the overlay.
 	TripleBarrier engine.TripleBarrierConfig
+	// BayesShrink toggles Bayesian shrinkage of per-strategy RR (Phase
+	// 2.1). When true, RunWFA fits meta.BayesianShrinkRR on the IS
+	// trade slice of each window and passes the resulting map down via
+	// engine.BacktestParams.PerStrategyRR for the OOS replay — letting
+	// high-volume strategies trade their own data-driven RR while
+	// sparse strategies revert to the global prior (strategy.DefaultRR).
+	// Default false preserves the legacy uniform-RR baseline bit-for-bit.
+	BayesShrink bool
 }
 
 // WFAWindow holds one IS→OOS slice plus the OOS-side performance.
@@ -133,6 +141,26 @@ func RunWFA(cfg WFAConfig, candles []core.Candle, h4Candles []core.Candle) (WFAR
 		weights := make(map[string]float64, len(weightsList))
 		for _, w := range weightsList {
 			weights[w.Strategy] = w.Weight
+		}
+
+		// Bayesian shrinkage of per-strategy RR (Phase 2.1, opt-in).
+		// EMPIRICAL VERDICT 2026-05-11: shrinkage HURTS the OOS curve on
+		// this system (NetR −27% vs no-shrink baseline, regardless of
+		// prior choice — static 2.0 and median-RR priors both produce
+		// the same regression). Root cause: winning strategies earn
+		// > 2R in OOS but the shrinkage pulls their RR DOWN toward the
+		// prior, leaving expectancy on the table. The mathematics is
+		// sound (sample-size-weighted variance vs bias tradeoff), but
+		// the premise — that sparse per-strategy RR estimates overfit —
+		// is empirically false here: the OOS rewards the per-strategy
+		// MLE more than the conservative prior.
+		//
+		// Kept as opt-in so future experimenters can try other priors
+		// (per-window estimator, per-side prior, etc.) without
+		// re-implementing the shrinkage math. Default false preserves
+		// the wfa#13 / wfa#14 baseline bit-for-bit.
+		if cfg.BayesShrink {
+			params.PerStrategyRR = meta.BayesianShrinkRR(isResult.Trades, strategy.DefaultRR)
 		}
 
 		// Fresh threshold buffer per OOS window — state should NOT bleed
@@ -334,6 +362,13 @@ func SimulateOOS(candles []core.Candle, p engine.BacktestParams, compose Compose
 					}
 				}
 			}
+		}
+		// Per-strategy RR override (Bayesian shrinkage, Phase 2.1).
+		// Mirrors the engine.RunBacktest path so OOS replay applies the
+		// same TP transform as the IS backtest would have, keyed off the
+		// strategy whose levels the composite chose to take.
+		if rr, ok := p.PerStrategyRR[cs.WinnerStrategy]; ok && rr > 0 {
+			tp = strategy.TPFromRR(entry, sl, rr, cs.Side == core.Long)
 		}
 		if p.MaxSLPoints > 0 && math.Abs(entry-sl) > p.MaxSLPoints {
 			continue

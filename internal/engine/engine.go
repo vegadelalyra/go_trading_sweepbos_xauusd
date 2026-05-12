@@ -50,6 +50,15 @@ type BacktestParams struct {
 	// partial-leg-at-+PartialR + breakeven-on-remainder + time-stop-on-
 	// stagnation. See TripleBarrierConfig for the per-knob semantics.
 	TripleBarrier TripleBarrierConfig
+	// PerStrategyRR, when non-nil, overrides the TP that each emitted
+	// signal carries: if PerStrategyRR[sig.Strategy] > 0 the TP is
+	// recomputed via strategy.TPFromRR using the supplied RR (the SL
+	// stays as the strategy decided, only the asymmetry changes). Used
+	// by WFA's Bayesian shrinkage path to let high-volume strategies
+	// trade their own data-driven RR while sparse ones revert to the
+	// global prior. Default nil = legacy behaviour, every strategy
+	// keeps its baked-in RR.
+	PerStrategyRR map[string]float64
 }
 
 // TripleBarrierConfig parametrises the triple-barrier exit overlay. All
@@ -291,6 +300,17 @@ func RunBacktest(candles []core.Candle, strategies []strategy.Strategy, p Backte
 				if sig.Side == core.Short && dr.InDiscount(sig.Entry) {
 					continue
 				}
+			}
+			// Per-strategy RR override (Bayesian shrinkage, Phase 2.1).
+			// When the caller supplies a PerStrategyRR map, the strategy's
+			// baked-in TP is recomputed using the shrunk RR — same SL
+			// anchor, different asymmetry. Sparse strategies in the map
+			// land on the global prior, dense ones on their own MLE.
+			// Applied AFTER ATR widening so the shrinkage is the final
+			// word on TP. Strategies absent from the map keep their
+			// intrinsic TP.
+			if rr, ok := p.PerStrategyRR[sig.Strategy]; ok && rr > 0 {
+				sig.TP = strategy.TPFromRR(sig.Entry, sig.SL, rr, sig.Side == core.Long)
 			}
 			// Engine-level guard: reject signals whose SL distance is unreasonable.
 			if p.MaxSLPoints > 0 {
