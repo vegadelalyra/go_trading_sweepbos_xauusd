@@ -583,6 +583,10 @@ func runWFA(args []string) int {
 	pdLookback := fs.Int("pd-lookback", 0, "Premium/Discount filter lookback in candles (0 disables)")
 	slippage := fs.Float64("slippage", 0, "SL slippage in dollars (0 disables)")
 	slippageNewsMult := fs.Float64("slippage-news-mult", 1.0, "multiplier applied to slippage in news windows")
+	tripleBarrier := fs.Bool("triple-barrier", false, "enable triple-barrier exit (partial-TP @ +PartialR, breakeven on remainder, dynamic time-stop)")
+	tbPartialR := fs.Float64("tb-partial-r", 1.5, "triple-barrier: R-multiple at which the partial leg fires")
+	tbTimeStopCandles := fs.Int("tb-time-stop-candles", 8, "triple-barrier: bars after which the dynamic time-stop becomes eligible")
+	tbTimeStopRangeR := fs.Float64("tb-time-stop-r", 0.3, "triple-barrier: |R| band that classifies the position as stagnating")
 	persist := fs.Bool("persist", false, "store this WFA run + every OOS trade in wfa_runs/wfa_trades")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -611,6 +615,12 @@ func runWFA(args []string) int {
 		PDLookback:          *pdLookback,
 		Slippage:            *slippage,
 		SlippageNewsMult:    *slippageNewsMult,
+		TripleBarrier: engine.TripleBarrierConfig{
+			Enabled:         *tripleBarrier,
+			PartialR:        *tbPartialR,
+			TimeStopCandles: *tbTimeStopCandles,
+			TimeStopRangeR:  *tbTimeStopRangeR,
+		},
 	}
 	candles, err := loadCandles(ctx, pool, cfg.Symbol, cfg.Interval, cfg.StartDate, cfg.EndDate)
 	if err != nil {

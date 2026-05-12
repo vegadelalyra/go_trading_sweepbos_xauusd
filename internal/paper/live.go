@@ -373,10 +373,9 @@ func acceptSignal(candles []core.Candle, i int, cs meta.CompositeSignal, p engin
 }
 
 // gradeOne walks the candles AFTER pos.EntryTime looking for the first
-// SL/TP touch or time-stop crossing. Returns the closed Trade or
-// (nil, false) if still pending. The lifecycle mirrors engine.RunBacktest's
-// intra-position block — drift between the two would silently bias paper
-// stats.
+// SL / TP / partial-TP / time-stop crossing using the same lifecycle as
+// engine.RunBacktest and wfa.SimulateOOS — delegates to engine.AdvanceTrade
+// so the three replay sites share one source of truth.
 func gradeOne(pos pendingPosition, candles []core.Candle, p engine.BacktestParams) (*core.Trade, bool) {
 	entryIdx := sort.Search(len(candles), func(i int) bool {
 		return !candles[i].Time.Before(pos.EntryTime)
@@ -384,104 +383,26 @@ func gradeOne(pos pendingPosition, candles []core.Candle, p engine.BacktestParam
 	if entryIdx >= len(candles) {
 		return nil, false
 	}
+	open := &core.Trade{
+		Strategy:  pos.Strategy,
+		Side:      pos.Side,
+		EntryIdx:  entryIdx,
+		EntryTime: pos.EntryTime,
+		Entry:     pos.Entry,
+		SL:        pos.SL,
+		TP:        pos.TP,
+	}
 	// Scan forward starting at the bar AFTER entry.
 	for i := entryIdx + 1; i < len(candles); i++ {
-		c := candles[i]
-		held := i - entryIdx
-		exitPrice, r, win, hit := checkExit(pos, c, p)
-		if !hit && p.MaxHoldCandles > 0 && held >= p.MaxHoldCandles {
-			// Time-stop: close at this candle's close, R = realised %.
-			exitPrice = c.Close
-			if pos.Side == core.Long {
-				rd := pos.Entry - pos.SL
-				if rd > 0 {
-					r = (c.Close - pos.Entry) / rd
-				}
-			} else {
-				rd := pos.SL - pos.Entry
-				if rd > 0 {
-					r = (pos.Entry - c.Close) / rd
-				}
-			}
-			win = r > 0
-			hit = true
-		}
-		if hit {
-			return &core.Trade{
-				Strategy:      pos.Strategy,
-				Side:          pos.Side,
-				EntryIdx:      entryIdx,
-				ExitIdx:       i,
-				EntryTime:     pos.EntryTime,
-				ExitTime:      c.Time,
-				Entry:         pos.Entry,
-				SL:            pos.SL,
-				TP:            pos.TP,
-				ExitPrice:     exitPrice,
-				R:             r,
-				Win:           win,
-				CandlesToExit: held,
-				Session:       core.ClassifySession(pos.EntryTime),
-				YearMonth:     core.YearMonthBucket(pos.EntryTime),
-				YearQuarter:   core.YearQuarterBucket(pos.EntryTime),
-			}, true
+		if engine.AdvanceTrade(open, candles[i], i, p) {
+			open.CandlesToExit = open.ExitIdx - entryIdx
+			open.Session = core.ClassifySession(pos.EntryTime)
+			open.YearMonth = core.YearMonthBucket(pos.EntryTime)
+			open.YearQuarter = core.YearQuarterBucket(pos.EntryTime)
+			return open, true
 		}
 	}
 	return nil, false
-}
-
-// checkExit is the per-candle SL/TP fill check, factored out so gradeOne
-// stays readable. Returns the exit price/R/win and whether the candle
-// resolved the position.
-func checkExit(pos pendingPosition, c core.Candle, p engine.BacktestParams) (exitPrice, r float64, win, hit bool) {
-	slip := engine.SLPenalty(p, c.Time)
-	if pos.Side == core.Long {
-		if c.Low <= pos.SL {
-			if slip > 0 {
-				exit := pos.SL - slip
-				if c.Low < exit {
-					exit = c.Low
-				}
-				exitPrice = exit - p.SpreadDollar
-				riskDist := pos.Entry - pos.SL
-				actualLoss := pos.Entry - exit + p.SpreadDollar
-				r = -actualLoss / riskDist
-			} else {
-				exitPrice = pos.SL - p.SpreadDollar
-				r = -1
-			}
-			return exitPrice, r, false, true
-		}
-		if c.High >= pos.TP {
-			exitPrice = pos.TP - p.SpreadDollar
-			r = (pos.TP - pos.Entry) / (pos.Entry - pos.SL)
-			return exitPrice, r, true, true
-		}
-		return 0, 0, false, false
-	}
-	// SHORT
-	if c.High >= pos.SL {
-		if slip > 0 {
-			exit := pos.SL + slip
-			if c.High > exit {
-				exit = c.High
-			}
-			exitPrice = exit + p.SpreadDollar
-			riskDist := pos.SL - pos.Entry
-			actualLoss := exit - pos.Entry + p.SpreadDollar
-			r = -actualLoss / riskDist
-		} else {
-			exitPrice = pos.SL + p.SpreadDollar
-			r = -1
-		}
-		return exitPrice, r, false, true
-	}
-	if c.Low <= pos.TP {
-		exitPrice = pos.TP + p.SpreadDollar
-		r = (pos.Entry - pos.TP) / (pos.SL - pos.Entry)
-		return exitPrice, r, true, true
-	}
-	return 0, 0, false, false
 }
 
 // ── DB helpers ──────────────────────────────────────────────────────────

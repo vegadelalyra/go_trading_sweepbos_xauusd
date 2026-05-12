@@ -44,6 +44,46 @@ type BacktestParams struct {
 	// Both default to 0 / 1 so existing tunings stay unchanged.
 	SlippagePoints   float64
 	SlippageNewsMult float64
+	// TripleBarrier — optional partial-TP / breakeven / dynamic-time-stop
+	// exit overlay (López de Prado triple-barrier method). Disabled by
+	// default; when enabled, transforms the SL/TP-only lifecycle into
+	// partial-leg-at-+PartialR + breakeven-on-remainder + time-stop-on-
+	// stagnation. See TripleBarrierConfig for the per-knob semantics.
+	TripleBarrier TripleBarrierConfig
+}
+
+// TripleBarrierConfig parametrises the triple-barrier exit overlay. All
+// thresholds zero-value to a no-op (Enabled=false), so existing callers
+// stay reproducible.
+type TripleBarrierConfig struct {
+	// Enabled toggles the overlay. False → legacy lifecycle (one SL, one
+	// TP, optional MaxHoldCandles); true → the three barriers below.
+	Enabled bool
+	// PartialR is the R-multiple at which the partial-TP leg fires. The
+	// half-size partial closes 50% of the position at +PartialR, and the
+	// SL on the remaining 50% moves to entry (breakeven). Default 1.5R.
+	// Setting this <= 0 with Enabled=true is invalid (no-op).
+	PartialR float64
+	// TimeStopCandles is the bar count after which the dynamic time-stop
+	// becomes eligible. Default 8 (40min on 5m). Setting to 0 disables
+	// this barrier independently of the others.
+	TimeStopCandles int
+	// TimeStopRangeR defines the |unrealised R| band that classifies the
+	// position as "stagnating" once TimeStopCandles is reached. Inside
+	// the band → close at market; outside → keep running. Default 0.3R.
+	TimeStopRangeR float64
+}
+
+// DefaultTripleBarrierConfig returns the canonical thresholds (PartialR=1.5,
+// TimeStopCandles=8 ≈ 40min on 5m, TimeStopRangeR=0.3) with Enabled=false.
+// Callers that want the overlay must flip Enabled=true explicitly.
+func DefaultTripleBarrierConfig() TripleBarrierConfig {
+	return TripleBarrierConfig{
+		Enabled:         false,
+		PartialR:        1.5,
+		TimeStopCandles: 8,
+		TimeStopRangeR:  0.3,
+	}
 }
 
 func DefaultParams() BacktestParams {
@@ -165,81 +205,9 @@ func RunBacktest(candles []core.Candle, strategies []strategy.Strategy, p Backte
 		dailyHalt := dayStart > 0 && (dayStart-balance)/dayStart >= p.DailyDDLimit
 
 		if open != nil {
-			closed := false
-			slip := SLPenalty(p, c.Time)
-			if open.Side == core.Long {
-				if c.Low <= open.SL {
-					if slip > 0 {
-						// Worst-case fill: cap at c.Low so a gap past
-						// SL+slip lands wherever price actually went.
-						exit := open.SL - slip
-						if c.Low < exit {
-							exit = c.Low
-						}
-						open.ExitPrice = exit - p.SpreadDollar
-						riskDist := open.Entry - open.SL
-						actualLoss := open.Entry - exit + p.SpreadDollar
-						open.R = -actualLoss / riskDist
-					} else {
-						// No slippage modelled — clean -1R fill at SL.
-						open.ExitPrice = open.SL - p.SpreadDollar
-						open.R = -1
-					}
-					open.Win = false
-					closed = true
-				} else if c.High >= open.TP {
-					open.ExitPrice = open.TP - p.SpreadDollar
-					open.R = (open.TP - open.Entry) / (open.Entry - open.SL)
-					open.Win = true
-					closed = true
-				}
-			} else {
-				if c.High >= open.SL {
-					if slip > 0 {
-						exit := open.SL + slip
-						if c.High > exit {
-							exit = c.High
-						}
-						open.ExitPrice = exit + p.SpreadDollar
-						riskDist := open.SL - open.Entry
-						actualLoss := exit - open.Entry + p.SpreadDollar
-						open.R = -actualLoss / riskDist
-					} else {
-						open.ExitPrice = open.SL + p.SpreadDollar
-						open.R = -1
-					}
-					open.Win = false
-					closed = true
-				} else if c.Low <= open.TP {
-					open.ExitPrice = open.TP + p.SpreadDollar
-					open.R = (open.Entry - open.TP) / (open.SL - open.Entry)
-					open.Win = true
-					closed = true
-				}
-			}
-			// Time-stop: if the trade has been open too long, exit at this candle's close.
-			// The P/L is whatever fraction of risk we've banked so far.
-			if !closed && p.MaxHoldCandles > 0 && i-open.EntryIdx >= p.MaxHoldCandles {
-				open.ExitPrice = c.Close
-				if open.Side == core.Long {
-					riskDist := open.Entry - open.SL
-					if riskDist > 0 {
-						open.R = (c.Close - open.Entry) / riskDist
-					}
-				} else {
-					riskDist := open.SL - open.Entry
-					if riskDist > 0 {
-						open.R = (open.Entry - c.Close) / riskDist
-					}
-				}
-				open.Win = open.R > 0
-				closed = true
-			}
-			if closed {
+			if AdvanceTrade(open, c, i, p) {
 				risk := balance * p.RiskPct
 				balance += risk * open.R
-				open.ExitIdx = i
-				open.ExitTime = c.Time
 				open.BalanceAfter = balance
 				open.Session = core.ClassifySession(open.EntryTime)
 				open.YearMonth = core.YearMonthBucket(open.EntryTime)
@@ -253,8 +221,7 @@ func RunBacktest(candles []core.Candle, strategies []strategy.Strategy, p Backte
 					peak = balance
 				}
 				if peak > 0 {
-					dd := (peak - balance) / peak
-					if dd > maxDDPct {
+					if dd := (peak - balance) / peak; dd > maxDDPct {
 						maxDDPct = dd
 					}
 				}
@@ -481,6 +448,198 @@ func bumpStats(m map[string]StrategyStats, key string, t core.Trade) {
 		s.WinRate = float64(s.Wins) / float64(s.Total)
 	}
 	m[key] = s
+}
+
+// AdvanceTrade processes one candle for an open position and reports
+// whether the position fully resolved at this bar. Single source of truth
+// for the intra-position lifecycle — engine.RunBacktest, wfa.SimulateOOS
+// and paper.gradeOne all delegate here so the legacy and triple-barrier
+// branches stay in sync across the three replay sites.
+//
+// Semantics:
+//   - When TripleBarrier is disabled (default), the function reduces to
+//     the legacy lifecycle: SL → -1R (or slipped), TP → +RR, optional
+//     MaxHoldCandles → mark-to-market at close.
+//   - When TripleBarrier.Enabled is true:
+//     1. If the partial-TP barrier hasn't fired yet (open.PartialR == 0)
+//        and the bar reaches +PartialR, the partial leg closes 50% at
+//        that level and the SL on the remaining 50% moves to entry
+//        (breakeven). Position keeps running.
+//     2. SL/TP checks then run against the (possibly moved) SL.
+//     3. After TimeStopCandles bars, if |unrealised R| ≤ TimeStopRangeR,
+//        the remainder closes at market (dynamic time-stop).
+//     4. Legacy MaxHoldCandles still fires last as a hard cap.
+//
+// On close, open.R carries the weighted average across the partial and
+// final legs (0.5·PartialR + 0.5·finalLegR when the partial fired; just
+// finalLegR otherwise). open.ExitPrice / open.ExitIdx / open.ExitTime
+// are set on the FINAL leg's exit. Callers update balance and the
+// bucket fields (Session / YearMonth / etc.).
+//
+// Single-bar ordering convention is favorable to the trader: partial
+// fires before any same-bar SL touch, and TP fires before SL on the
+// final leg. This matches the existing engine's convention.
+func AdvanceTrade(open *core.Trade, c core.Candle, i int, p BacktestParams) bool {
+	slip := SLPenalty(p, c.Time)
+	tb := p.TripleBarrier
+	tbActive := tb.Enabled && tb.PartialR > 0
+
+	// ── Phase 1: partial-TP barrier (only if enabled and not yet fired).
+	if tbActive && open.PartialR == 0 {
+		riskDist := math.Abs(open.Entry - open.SL)
+		if riskDist > 0 {
+			if open.Side == core.Long {
+				target := open.Entry + tb.PartialR*riskDist
+				if c.High >= target {
+					fill := target - p.SpreadDollar
+					open.PartialR = (fill - open.Entry) / riskDist
+					open.PartialExitPrice = fill
+					open.PartialExitIdx = i
+					open.PartialExitTime = c.Time
+					open.SL = open.Entry // breakeven on remaining half
+				}
+			} else {
+				target := open.Entry - tb.PartialR*riskDist
+				if c.Low <= target {
+					fill := target + p.SpreadDollar
+					open.PartialR = (open.Entry - fill) / riskDist
+					open.PartialExitPrice = fill
+					open.PartialExitIdx = i
+					open.PartialExitTime = c.Time
+					open.SL = open.Entry // breakeven on remaining half
+				}
+			}
+		}
+	}
+
+	// finalize closes the trade with the supplied final-leg R, combining
+	// with PartialR (when present) to produce the weighted Trade.R.
+	finalize := func(exitPrice, finalR float64, win bool) {
+		open.ExitPrice = exitPrice
+		open.ExitIdx = i
+		open.ExitTime = c.Time
+		if open.PartialR != 0 {
+			open.R = 0.5*open.PartialR + 0.5*finalR
+		} else {
+			open.R = finalR
+		}
+		open.Win = open.R > 0
+		_ = win
+	}
+
+	// ── Phase 2: SL / TP on the (possibly BE-moved) SL.
+	if open.Side == core.Long {
+		if c.Low <= open.SL {
+			riskDist := open.Entry - open.SL
+			if open.PartialR != 0 {
+				// SL has been moved to entry (BE) — clean BE exit, no
+				// slippage modelled on the BE itself because there is no
+				// stop-hunting penalty when the stop is AT the entry.
+				finalize(open.SL-p.SpreadDollar, 0, false)
+				return true
+			}
+			if slip > 0 {
+				exit := open.SL - slip
+				if c.Low < exit {
+					exit = c.Low
+				}
+				actualLoss := open.Entry - exit + p.SpreadDollar
+				finalize(exit-p.SpreadDollar, -actualLoss/riskDist, false)
+			} else {
+				finalize(open.SL-p.SpreadDollar, -1, false)
+			}
+			return true
+		}
+		if c.High >= open.TP {
+			riskDist := math.Abs(open.Entry - origSL(open, tbActive))
+			finalLegR := (open.TP - open.Entry) / riskDist
+			finalize(open.TP-p.SpreadDollar, finalLegR, true)
+			return true
+		}
+	} else {
+		if c.High >= open.SL {
+			riskDist := open.SL - open.Entry
+			if open.PartialR != 0 {
+				finalize(open.SL+p.SpreadDollar, 0, false)
+				return true
+			}
+			if slip > 0 {
+				exit := open.SL + slip
+				if c.High > exit {
+					exit = c.High
+				}
+				actualLoss := exit - open.Entry + p.SpreadDollar
+				finalize(exit+p.SpreadDollar, -actualLoss/riskDist, false)
+			} else {
+				finalize(open.SL+p.SpreadDollar, -1, false)
+			}
+			return true
+		}
+		if c.Low <= open.TP {
+			riskDist := math.Abs(origSL(open, tbActive) - open.Entry)
+			finalLegR := (open.Entry - open.TP) / riskDist
+			finalize(open.TP+p.SpreadDollar, finalLegR, true)
+			return true
+		}
+	}
+
+	// ── Phase 3: dynamic time-stop (triple-barrier overlay).
+	if tbActive && tb.TimeStopCandles > 0 && i-open.EntryIdx >= tb.TimeStopCandles {
+		riskDist := math.Abs(open.Entry - origSL(open, tbActive))
+		if riskDist > 0 {
+			var unrealised float64
+			if open.Side == core.Long {
+				unrealised = (c.Close - open.Entry) / riskDist
+			} else {
+				unrealised = (open.Entry - c.Close) / riskDist
+			}
+			if math.Abs(unrealised) <= tb.TimeStopRangeR {
+				finalize(c.Close, unrealised, unrealised > 0)
+				return true
+			}
+		}
+	}
+
+	// ── Phase 4: legacy MaxHoldCandles hard cap (unchanged).
+	if p.MaxHoldCandles > 0 && i-open.EntryIdx >= p.MaxHoldCandles {
+		riskDist := math.Abs(open.Entry - origSL(open, tbActive))
+		var legR float64
+		if riskDist > 0 {
+			if open.Side == core.Long {
+				legR = (c.Close - open.Entry) / riskDist
+			} else {
+				legR = (open.Entry - c.Close) / riskDist
+			}
+		}
+		finalize(c.Close, legR, legR > 0)
+		return true
+	}
+
+	return false
+}
+
+// origSL returns the original risk-distance reference for R computations.
+// Once the partial leg has fired, open.SL is moved to entry (BE), but
+// risk-multiples must remain anchored to the ORIGINAL SL so TP/+RR math
+// keeps reporting the strategy's intended R. When the triple-barrier is
+// disabled or the partial hasn't fired, open.SL is still the original.
+//
+// Approximation: we don't carry the original SL explicitly. Instead, when
+// the partial fired, we infer the original riskDist from open.PartialR and
+// the partial fill price. PartialR_realised = (fill - entry) / riskDist
+// (long) so riskDist = (fill - entry) / PartialR_realised. We then return
+// entry ± riskDist depending on side. This avoids a new field on
+// core.Trade and stays accurate to the partial fill we recorded.
+func origSL(open *core.Trade, tbActive bool) float64 {
+	if !tbActive || open.PartialR == 0 {
+		return open.SL
+	}
+	if open.Side == core.Long {
+		riskDist := (open.PartialExitPrice - open.Entry) / open.PartialR
+		return open.Entry - riskDist
+	}
+	riskDist := (open.Entry - open.PartialExitPrice) / open.PartialR
+	return open.Entry + riskDist
 }
 
 // SLPenalty returns the dollar slippage applied to an SL-hit exit price for

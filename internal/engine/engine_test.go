@@ -208,3 +208,133 @@ func TestComputeStats_Deterministic(t *testing.T) {
 		t.Fatalf("NetR=%v, want 2.0", s1.NetR)
 	}
 }
+
+// AdvanceTrade is the single source of truth for the intra-position
+// lifecycle (engine/wfa/paper all delegate). These tests pin down both
+// the legacy path (TripleBarrier disabled — must reproduce the
+// historical -1R/+RR/MaxHold behavior) and the triple-barrier overlay.
+
+// Legacy SHORT TP: SL at 110, TP at 90, entry at 100 → c.Low ≤ 90 on a
+// bar should produce R = (100-90)/(110-100) = +1.0R cleanly.
+func TestAdvanceTrade_LegacyShortTP(t *testing.T) {
+	p := DefaultParams()
+	p.SpreadDollar = 0
+	open := &core.Trade{
+		Side: core.Short, EntryIdx: 0, Entry: 100, SL: 110, TP: 90,
+	}
+	c := core.Candle{Time: time.Now(), Open: 95, High: 95, Low: 89, Close: 90}
+	if !AdvanceTrade(open, c, 5, p) {
+		t.Fatal("expected close on TP touch")
+	}
+	if math.Abs(open.R-1.0) > 1e-9 {
+		t.Fatalf("R=%v, want +1", open.R)
+	}
+	if !open.Win {
+		t.Fatal("expected Win on TP")
+	}
+	if open.PartialR != 0 {
+		t.Fatalf("legacy run set PartialR=%v, want 0", open.PartialR)
+	}
+}
+
+// Legacy LONG SL: clean -1R when no slippage modelled, ExitPrice = SL - spread.
+func TestAdvanceTrade_LegacyLongSL(t *testing.T) {
+	p := DefaultParams()
+	p.SpreadDollar = 0.5
+	open := &core.Trade{
+		Side: core.Long, EntryIdx: 0, Entry: 100, SL: 98, TP: 104,
+	}
+	c := core.Candle{Time: time.Now(), Open: 99, High: 99, Low: 97, Close: 97.5}
+	if !AdvanceTrade(open, c, 3, p) {
+		t.Fatal("expected close on SL touch")
+	}
+	if math.Abs(open.R-(-1)) > 1e-9 {
+		t.Fatalf("R=%v, want -1", open.R)
+	}
+	if math.Abs(open.ExitPrice-(98-0.5)) > 1e-9 {
+		t.Fatalf("ExitPrice=%v, want 97.5", open.ExitPrice)
+	}
+}
+
+// Triple-barrier partial-TP only: a bar that just touches +1.5R triggers
+// the partial leg but does NOT close the trade. SL must move to entry.
+func TestAdvanceTrade_TBPartialFiresMovesSLToBE(t *testing.T) {
+	p := DefaultParams()
+	p.SpreadDollar = 0
+	p.TripleBarrier = TripleBarrierConfig{
+		Enabled: true, PartialR: 1.5, TimeStopCandles: 8, TimeStopRangeR: 0.3,
+	}
+	open := &core.Trade{
+		Side: core.Long, EntryIdx: 0, Entry: 100, SL: 98, TP: 104,
+	}
+	// riskDist=2, partial target=100+1.5*2=103. High=103, low stays above entry.
+	c := core.Candle{Time: time.Now(), Open: 101, High: 103, Low: 101, Close: 102}
+	closed := AdvanceTrade(open, c, 4, p)
+	if closed {
+		t.Fatal("partial fired alone — trade should NOT be closed")
+	}
+	if math.Abs(open.PartialR-1.5) > 1e-9 {
+		t.Fatalf("PartialR=%v, want +1.5", open.PartialR)
+	}
+	if open.SL != 100 {
+		t.Fatalf("SL=%v, want 100 (BE)", open.SL)
+	}
+}
+
+// After partial fires, an SL touch at BE produces R=0 on the final leg
+// and Trade.R = 0.5*1.5 + 0.5*0 = +0.75.
+func TestAdvanceTrade_TBPartialThenBEHitYieldsWeightedR(t *testing.T) {
+	p := DefaultParams()
+	p.SpreadDollar = 0
+	p.TripleBarrier = TripleBarrierConfig{
+		Enabled: true, PartialR: 1.5, TimeStopCandles: 8, TimeStopRangeR: 0.3,
+	}
+	open := &core.Trade{
+		Side: core.Long, EntryIdx: 0, Entry: 100, SL: 98, TP: 104,
+	}
+	// Bar 1: partial fires (high=103).
+	c1 := core.Candle{Time: time.Now(), Open: 101, High: 103, Low: 101, Close: 102}
+	if AdvanceTrade(open, c1, 4, p) {
+		t.Fatal("partial alone should not close trade")
+	}
+	// Bar 2: SL_BE (=100) hit.
+	c2 := core.Candle{Time: time.Now(), Open: 100, High: 100, Low: 99, Close: 99.5}
+	if !AdvanceTrade(open, c2, 5, p) {
+		t.Fatal("BE hit on remaining leg should close trade")
+	}
+	if math.Abs(open.R-0.75) > 1e-9 {
+		t.Fatalf("R=%v, want +0.75 (= (1.5+0)/2)", open.R)
+	}
+	if !open.Win {
+		t.Fatal("weighted R is positive — expected Win=true")
+	}
+}
+
+// Dynamic time-stop: after TimeStopCandles bars, if |unrealised R| ≤
+// TimeStopRangeR, close at market.
+func TestAdvanceTrade_TBDynamicTimeStopOnStagnation(t *testing.T) {
+	p := DefaultParams()
+	p.SpreadDollar = 0
+	p.TripleBarrier = TripleBarrierConfig{
+		Enabled: true, PartialR: 1.5, TimeStopCandles: 3, TimeStopRangeR: 0.3,
+	}
+	open := &core.Trade{
+		Side: core.Long, EntryIdx: 0, Entry: 100, SL: 98, TP: 104,
+	}
+	// Two flat bars, neither partial nor SL/TP triggers.
+	flat := core.Candle{Time: time.Now(), Open: 100.1, High: 100.1, Low: 99.9, Close: 100.05}
+	if AdvanceTrade(open, flat, 1, p) {
+		t.Fatal("flat bar at i=1 should not close")
+	}
+	if AdvanceTrade(open, flat, 2, p) {
+		t.Fatal("flat bar at i=2 should not close")
+	}
+	// i=3 == EntryIdx+3 == TimeStopCandles → eligible. Close=100.05 is
+	// 0.025R above entry (riskDist=2), well within 0.3R band → close.
+	if !AdvanceTrade(open, flat, 3, p) {
+		t.Fatal("stagnating bar at i=3 must trigger dynamic time-stop")
+	}
+	if math.Abs(open.R-0.025) > 1e-6 {
+		t.Fatalf("R=%v, want ~0.025 (close=100.05 vs entry=100 / risk=2)", open.R)
+	}
+}

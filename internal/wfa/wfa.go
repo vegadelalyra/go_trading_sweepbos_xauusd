@@ -59,6 +59,10 @@ type WFAConfig struct {
 	PDLookback          int // Premium/Discount filter lookback in candles (0 disables)
 	Slippage            float64
 	SlippageNewsMult    float64
+	// TripleBarrier — optional partial-TP / breakeven / dynamic-time-stop
+	// overlay passed through to the engine BacktestParams used inside
+	// each OOS window. Default zero-value disables the overlay.
+	TripleBarrier engine.TripleBarrierConfig
 }
 
 // WFAWindow holds one IS→OOS slice plus the OOS-side performance.
@@ -122,6 +126,7 @@ func RunWFA(cfg WFAConfig, candles []core.Candle, h4Candles []core.Candle) (WFAR
 		params.PDLookback = cfg.PDLookback
 		params.SlippagePoints = cfg.Slippage
 		params.SlippageNewsMult = cfg.SlippageNewsMult
+		params.TripleBarrier = cfg.TripleBarrier
 
 		isResult := engine.RunBacktest(isCandles, strategy.All(), params)
 		weightsList := computeWeights(isResult.Trades)
@@ -260,76 +265,9 @@ func SimulateOOS(candles []core.Candle, p engine.BacktestParams, compose Compose
 		dailyHalt := dayStart > 0 && (dayStart-balance)/dayStart >= p.DailyDDLimit
 
 		if open != nil {
-			closed := false
-			slip := engine.SLPenalty(p, c.Time)
-			if open.Side == core.Long {
-				if c.Low <= open.SL {
-					if slip > 0 {
-						exit := open.SL - slip
-						if c.Low < exit {
-							exit = c.Low
-						}
-						open.ExitPrice = exit - p.SpreadDollar
-						riskDist := open.Entry - open.SL
-						actualLoss := open.Entry - exit + p.SpreadDollar
-						open.R = -actualLoss / riskDist
-					} else {
-						open.ExitPrice = open.SL - p.SpreadDollar
-						open.R = -1
-					}
-					open.Win = false
-					closed = true
-				} else if c.High >= open.TP {
-					open.ExitPrice = open.TP - p.SpreadDollar
-					open.R = (open.TP - open.Entry) / (open.Entry - open.SL)
-					open.Win = true
-					closed = true
-				}
-			} else {
-				if c.High >= open.SL {
-					if slip > 0 {
-						exit := open.SL + slip
-						if c.High > exit {
-							exit = c.High
-						}
-						open.ExitPrice = exit + p.SpreadDollar
-						riskDist := open.SL - open.Entry
-						actualLoss := exit - open.Entry + p.SpreadDollar
-						open.R = -actualLoss / riskDist
-					} else {
-						open.ExitPrice = open.SL + p.SpreadDollar
-						open.R = -1
-					}
-					open.Win = false
-					closed = true
-				} else if c.Low <= open.TP {
-					open.ExitPrice = open.TP + p.SpreadDollar
-					open.R = (open.Entry - open.TP) / (open.SL - open.Entry)
-					open.Win = true
-					closed = true
-				}
-			}
-			if !closed && p.MaxHoldCandles > 0 && i-open.EntryIdx >= p.MaxHoldCandles {
-				open.ExitPrice = c.Close
-				if open.Side == core.Long {
-					rd := open.Entry - open.SL
-					if rd > 0 {
-						open.R = (c.Close - open.Entry) / rd
-					}
-				} else {
-					rd := open.SL - open.Entry
-					if rd > 0 {
-						open.R = (open.Entry - c.Close) / rd
-					}
-				}
-				open.Win = open.R > 0
-				closed = true
-			}
-			if closed {
+			if engine.AdvanceTrade(open, c, i, p) {
 				risk := balance * p.RiskPct
 				balance += risk * open.R
-				open.ExitIdx = i
-				open.ExitTime = c.Time
 				open.BalanceAfter = balance
 				open.Session = core.ClassifySession(open.EntryTime)
 				open.YearMonth = core.YearMonthBucket(open.EntryTime)
