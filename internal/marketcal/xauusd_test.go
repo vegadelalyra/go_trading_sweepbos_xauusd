@@ -104,6 +104,38 @@ func TestTradingDaysSince(t *testing.T) {
 	}
 }
 
+func TestNextMarketOpen(t *testing.T) {
+	cases := []struct {
+		when string
+		want string
+		desc string
+	}{
+		{"2026-05-08 21:00", "2026-05-10 22:00", "Friday close → Sunday 22 UTC"},
+		{"2026-05-08 23:30", "2026-05-10 22:00", "Friday late → Sunday 22 UTC"},
+		{"2026-05-09 00:00", "2026-05-10 22:00", "Saturday midnight → Sunday 22 UTC"},
+		{"2026-05-09 18:30", "2026-05-10 22:00", "Saturday afternoon → Sunday 22 UTC"},
+		{"2026-05-10 10:00", "2026-05-10 22:00", "Sunday morning → same Sunday 22 UTC"},
+		{"2026-05-10 21:59", "2026-05-10 22:00", "Sunday 21:59 → 22 UTC same day"},
+		// Already-open instant: defensive identity (callers normally guard
+		// with !IsXAUUSDTradingDay first, but the helper must not loop).
+		{"2026-05-12 14:30", "2026-05-12 14:30", "Already open → returned unchanged"},
+		// MLK Monday 2026-01-19 called during the holiday: jump to Tue 00 UTC.
+		{"2026-01-19 12:00", "2026-01-20 00:00", "MLK Monday → Tuesday 00 UTC"},
+		// Independence Day observed on Friday 2026-07-03: jumps to Sun 22 UTC.
+		{"2026-07-03 12:00", "2026-07-05 22:00", "Holiday-Friday → Sunday 22 UTC (skip Sat 00)"},
+		// Christmas 2026 = Friday: caller invoked Fri 12:00 → Sun 22 UTC.
+		{"2026-12-25 12:00", "2026-12-27 22:00", "Christmas Friday → Sunday 22 UTC"},
+	}
+	for _, c := range cases {
+		got := NextMarketOpen(tUTC(c.when))
+		want := tUTC(c.want)
+		if !got.Equal(want) {
+			t.Errorf("NextMarketOpen(%s) = %s, want %s — %s", c.when,
+				got.Format("2006-01-02 15:04"), c.want, c.desc)
+		}
+	}
+}
+
 func TestNthWeekdayOfMonth(t *testing.T) {
 	// 3rd Monday of January 2026 = Jan 19.
 	got := nthWeekdayOfMonth(2026, time.January, time.Monday, 3)

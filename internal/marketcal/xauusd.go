@@ -38,6 +38,48 @@ func IsXAUUSDTradingDay(t time.Time) bool {
 	return true
 }
 
+// NextMarketOpen returns the earliest UTC instant at-or-after t for which
+// IsXAUUSDTradingDay returns true. If t is already a trading instant it is
+// returned unchanged (defensive — callers normally guard with a closed
+// check first). The walk advances in semantic jumps:
+//
+//   - Friday ≥21 UTC or Saturday → Sunday 22:00 UTC of that weekend.
+//   - Sunday <22 UTC → same Sunday 22:00 UTC.
+//   - Weekday COMEX holiday → next day 00:00 UTC, then iterate forward
+//     skipping any further weekend/holiday gap (e.g. Friday observed
+//     holiday → land on Sunday 22:00, not Saturday 00:00).
+//
+// The loop is hard-capped at 14 days forward so a buggy holiday table
+// can never wedge the caller in an infinite spin.
+func NextMarketOpen(t time.Time) time.Time {
+	u := t.UTC()
+	if IsXAUUSDTradingDay(u) {
+		return u
+	}
+	candidate := nextCandidate(u)
+	deadline := u.Add(14 * 24 * time.Hour)
+	for !IsXAUUSDTradingDay(candidate) && candidate.Before(deadline) {
+		candidate = nextCandidate(candidate)
+	}
+	return candidate
+}
+
+// nextCandidate advances one closure-aware step from t toward the most
+// likely reopen instant. Pure helper for NextMarketOpen.
+func nextCandidate(t time.Time) time.Time {
+	y, m, d := t.Date()
+	switch {
+	case t.Weekday() == time.Friday && t.Hour() >= 21:
+		return time.Date(y, m, d+2, 22, 0, 0, 0, time.UTC)
+	case t.Weekday() == time.Saturday:
+		return time.Date(y, m, d+1, 22, 0, 0, 0, time.UTC)
+	case t.Weekday() == time.Sunday && t.Hour() < 22:
+		return time.Date(y, m, d, 22, 0, 0, 0, time.UTC)
+	default:
+		return time.Date(y, m, d+1, 0, 0, 0, 0, time.UTC)
+	}
+}
+
 // TradingDaysSince counts XAUUSD trading days that have BEGUN strictly
 // after prev's UTC calendar date and at-or-before now's UTC calendar
 // date. A "trading day" is a UTC date that is Monday-Friday and not a

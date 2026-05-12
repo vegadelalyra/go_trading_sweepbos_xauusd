@@ -162,6 +162,24 @@ func RunLive(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig,
 		default:
 		}
 
+		// Gate the loop on XAUUSD market hours. During weekly close
+		// (Fri 21 UTC → Sun 22 UTC) and COMEX holidays we sleep straight
+		// to the reopen instead of polling uselessly: saves TwelveData
+		// quota (~576 calls/weekend at 5m cadence) and keeps logs from
+		// drowning in NO-TRADE noise on stale Friday-close bars.
+		if now := time.Now().UTC(); !marketcal.IsXAUUSDTradingDay(now) {
+			nextOpen := marketcal.NextMarketOpen(now)
+			closedFor := time.Until(nextOpen) + 30*time.Second
+			log.Log("market closed — sleeping %s until %s UTC reopen",
+				closedFor.Round(time.Minute), nextOpen.Format("Mon 2006-01-02 15:04"))
+			select {
+			case <-ctx.Done():
+				return paperRunID, finalizeLiveRun(context.Background(), pool, paperRunID, time.Now().UTC(), log)
+			case <-time.After(closedFor):
+			}
+			continue
+		}
+
 		// Sleep until the next poll moment. PollSeconds=0 → align to the
 		// next interval boundary + 10s slack so TD has time to publish
 		// the just-closed candle. PollSeconds>0 → fixed cadence (useful
