@@ -257,6 +257,17 @@ func RunLive(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig,
 				} else {
 					log.Log("REJECT %s by %s — %s  |  net=%+.2f  vote=%.2f",
 						cs.Side.String(), cs.WinnerStrategy, reason, cs.NetWeight, cs.AppliedThreshold)
+					// Shadow: persist a virtual position with the same
+					// structural entry/SL/TP so we can audit later whether
+					// the gate that just fired is earning its rejection.
+					// Errors are logged but never abort the loop — shadow
+					// is informational, not load-bearing.
+					if shadowID, err := recordShadow(ctx, pool, paperRunID, cs, reason, latestClosed.Time); err != nil {
+						log.Log("shadow record error: %v", err)
+					} else if shadowID > 0 {
+						log.Log("SHADOW #%d  %s  %s  entry=%.2f  SL=%.2f  TP=%.2f  (rejected by %s)",
+							shadowID, cs.Side.String(), cs.WinnerStrategy, cs.BestEntry, cs.BestSL, cs.BestTP, classifyRejectGate(reason))
+					}
 				}
 			} else {
 				deficit := cs.AppliedThreshold - math.Abs(cs.NetWeight)
@@ -295,6 +306,40 @@ func RunLive(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig,
 		}
 		if stillOpen > 0 {
 			log.Log("pending=%d", stillOpen)
+		}
+
+		// ── Grade open shadow positions ────────────────────────────────
+		// Same lifecycle as pending: walk candles via AdvanceTrade, flip
+		// to status='closed' on resolution. Shadow errors never abort the
+		// loop — informational only.
+		shadows, err := loadOpenShadows(ctx, pool, paperRunID)
+		if err != nil {
+			log.Log("load shadows error: %v", err)
+			continue
+		}
+		shadowOpen := len(shadows)
+		for _, sh := range shadows {
+			tr, resolved := gradeShadow(sh, candles, params)
+			if !resolved {
+				continue
+			}
+			if err := closeShadow(ctx, pool, sh.ID, *tr); err != nil {
+				log.Log("close shadow #%d error: %v", sh.ID, err)
+				continue
+			}
+			shadowOpen--
+			result := "TP"
+			if !tr.Win {
+				result = "SL"
+			}
+			if params.MaxHoldCandles > 0 && tr.ExitIdx-tr.EntryIdx >= params.MaxHoldCandles {
+				result = "TIMESTOP"
+			}
+			log.Log("SHADOW-RESOLVED #%d  %s  exit=$%.2f  R=%+.2f  held=%dc  (%s, gate=%s)",
+				sh.ID, result, tr.ExitPrice, tr.R, tr.ExitIdx-tr.EntryIdx, sh.Strategy, sh.RejectGate)
+		}
+		if shadowOpen > 0 {
+			log.Log("shadows_open=%d", shadowOpen)
 		}
 	}
 }

@@ -61,6 +61,8 @@ func run(args []string) int {
 		return runPaperReplay(args[2:])
 	case "paper-live":
 		return runPaperLive(args[2:])
+	case "shadow-stats":
+		return runShadowStats(args[2:])
 	case "capital-sim":
 		return runCapitalSim(args[2:])
 	case "live-signal":
@@ -94,6 +96,7 @@ SUBCOMMANDS
   bootstrap     stationary block bootstrap CIs over a stored run's trades
   paper-replay  replay composite signals over historical candles with FIXED weights and persist results
   paper-live    long-running paper-trader: REST-poll latest candle every interval, signal, grade, persist
+  shadow-stats  aggregate shadow_trades (signals rejected by acceptSignal gates, graded as counter-factuals)
   capital-sim   simulate a fixed-risk + martingale capital scheme over a stored run's trades, per strategy
   live-signal   stream live ticks (TD WSS) and recompose the signal on REST polls
   import-cache  one-shot import of the legacy JSON cache into Postgres
@@ -1451,6 +1454,127 @@ func summarizeLiveRun(ctx context.Context, pool *pgxpool.Pool, paperRunID int64)
 		fmt.Printf("  NetR=%+.2f  (closed trades only)\n", *netR)
 	}
 	fmt.Printf("\n  Inspect: psql -c \"SELECT entry_time, strategy, side, r_realized, win FROM paper_trades WHERE paper_run_id=%d ORDER BY entry_time;\"\n", paperRunID)
+}
+
+// runShadowStats aggregates shadow_trades — counter-factual records of
+// signals that acceptSignal rejected (BIAS / PD / MAXSL gates), graded
+// against the same lifecycle as real paper trades. Use this to decide
+// whether a filter is earning its rejection rate (rejections should have
+// WR < accepted trades) or leaving R on the table (rejections WR > accepted
+// means the gate is overactive and worth relaxing in the next WFA cycle).
+//
+// Default groups by rejecter (the strategy whose signal was rejected); use
+// -by-gate to slice by which gate fired instead. -run-id=0 picks the most
+// recent live paper_runs row, matching the convention of weights/bootstrap.
+func runShadowStats(args []string) int {
+	fs := flag.NewFlagSet("shadow-stats", flag.ContinueOnError)
+	runID := fs.Int64("run-id", 0, "paper_runs.id to aggregate (0 = latest live run)")
+	byGate := fs.Bool("by-gate", false, "group by reject_gate (BIAS|PD|MAXSL) instead of by rejecter strategy")
+	includeOpen := fs.Bool("include-open", false, "also report count of in-flight shadows (status='open')")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	ctx := context.Background()
+	pool, err := openPool(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "db: %v\n", err)
+		return 1
+	}
+	defer pool.Close()
+
+	id := *runID
+	if id == 0 {
+		err = pool.QueryRow(ctx, `
+			SELECT id FROM paper_runs
+			WHERE is_live = true
+			ORDER BY id DESC LIMIT 1`).Scan(&id)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "find latest live paper_run: %v\n", err)
+			return 1
+		}
+	}
+
+	groupCol := "rejecter"
+	if *byGate {
+		groupCol = "reject_gate"
+	}
+	rows, err := pool.Query(ctx, fmt.Sprintf(`
+		SELECT %s AS bucket,
+		       COUNT(*)                          AS n,
+		       AVG(CASE WHEN win THEN 1.0 ELSE 0.0 END) AS wr,
+		       SUM(r_realized)                   AS net_r,
+		       AVG(r_realized)                   AS mean_r,
+		       AVG(candles_to_exit)              AS mean_bars
+		FROM shadow_trades
+		WHERE paper_run_id = $1 AND status = 'closed'
+		GROUP BY %s
+		ORDER BY net_r DESC`, groupCol, groupCol), id)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "shadow query: %v\n", err)
+		return 1
+	}
+	defer rows.Close()
+
+	type row struct {
+		bucket   string
+		n        int
+		wr       float64
+		netR     float64
+		meanR    float64
+		meanBars float64
+	}
+	var data []row
+	var totalN int
+	var totalNetR float64
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.bucket, &r.n, &r.wr, &r.netR, &r.meanR, &r.meanBars); err != nil {
+			fmt.Fprintf(os.Stderr, "scan: %v\n", err)
+			return 1
+		}
+		data = append(data, r)
+		totalN += r.n
+		totalNetR += r.netR
+	}
+	if err := rows.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "rows: %v\n", err)
+		return 1
+	}
+
+	bucketHdr := "Rejecter"
+	if *byGate {
+		bucketHdr = "Gate"
+	}
+	fmt.Printf("\nShadow stats — paper_runs.id=%d  (%d closed shadow trades)\n\n", id, totalN)
+	if totalN == 0 {
+		fmt.Println("  no closed shadows yet — run paper-live long enough for rejections to grade out")
+	} else {
+		fmt.Printf("  %-18s  %6s  %7s  %9s  %8s  %9s\n", bucketHdr, "N", "WR%", "NetR", "MeanR", "MeanBars")
+		fmt.Printf("  %-18s  %6s  %7s  %9s  %8s  %9s\n", "------------------", "------", "-------", "---------", "--------", "---------")
+		for _, r := range data {
+			fmt.Printf("  %-18s  %6d  %6.1f%%  %+9.2f  %+8.3f  %9.1f\n",
+				r.bucket, r.n, r.wr*100, r.netR, r.meanR, r.meanBars)
+		}
+		fmt.Printf("  %-18s  %6s  %7s  %9s\n", "------------------", "------", "-------", "---------")
+		fmt.Printf("  %-18s  %6d  %7s  %+9.2f\n", "TOTAL", totalN, "", totalNetR)
+		fmt.Println()
+		fmt.Println("  Reading: NetR > 0 on a rejecter/gate ⇒ filter is leaving R on the table;")
+		fmt.Println("           NetR < 0 ⇒ filter is earning its rejection. Compare to live paper_trades")
+		fmt.Println("           WR/NetR on the same run before relaxing anything.")
+	}
+
+	if *includeOpen {
+		var openN int
+		if err := pool.QueryRow(ctx, `
+			SELECT COUNT(*) FROM shadow_trades
+			WHERE paper_run_id = $1 AND status = 'open'`, id).Scan(&openN); err != nil {
+			fmt.Fprintf(os.Stderr, "open count: %v\n", err)
+		} else {
+			fmt.Printf("\n  in-flight shadows (status='open'): %d\n", openN)
+		}
+	}
+	return 0
 }
 
 func runCapitalSim(args []string) int {
