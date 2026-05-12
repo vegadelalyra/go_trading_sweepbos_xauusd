@@ -46,13 +46,19 @@ type WFAConfig struct {
 	StepMonths       int       // gap between successive IS starts
 	StartDate        time.Time // zero = beginning of available data
 	EndDate          time.Time // zero = up to most recent candle
-	Threshold        float64   // |NetWeight| required for an OOS entry
-	UseBias          bool
-	ATRMult          float64
-	H4Period         int
-	PDLookback       int // Premium/Discount filter lookback in candles (0 disables)
-	Slippage         float64
-	SlippageNewsMult float64
+	Threshold        float64   // |NetWeight| required for an OOS entry (used when ThresholdPercentile <= 0)
+	// ThresholdPercentile, when > 0, switches the OOS gate from the static
+	// `Threshold` to a percentile of the per-window rolling distribution of
+	// |NetWeight|. The buffer is fresh per OOS window (state never bleeds
+	// across windows), defaulting to DefaultThresholdBufferCap (~2000 bars).
+	// Mutually exclusive with Threshold — when set, Threshold is ignored.
+	ThresholdPercentile float64
+	UseBias             bool
+	ATRMult             float64
+	H4Period            int
+	PDLookback          int // Premium/Discount filter lookback in candles (0 disables)
+	Slippage            float64
+	SlippageNewsMult    float64
 }
 
 // WFAWindow holds one IS→OOS slice plus the OOS-side performance.
@@ -124,7 +130,18 @@ func RunWFA(cfg WFAConfig, candles []core.Candle, h4Candles []core.Candle) (WFAR
 			weights[w.Strategy] = w.Weight
 		}
 
+		// Fresh threshold buffer per OOS window — state should NOT bleed
+		// across windows because each window is supposed to be an
+		// independent OOS evaluation. The static-threshold path leaves
+		// buf nil so ComposeSignal's behavior is unchanged.
+		var buf *meta.ThresholdBuffer
+		if cfg.ThresholdPercentile > 0 {
+			buf = meta.NewThresholdBuffer(meta.DefaultThresholdBufferCap)
+		}
 		compose := func(c []core.Candle, a smc.Analysis, idx int) meta.CompositeSignal {
+			if buf != nil {
+				return meta.ComposeSignalDynamic(c, a, idx, weights, cfg.ThresholdPercentile, buf)
+			}
 			return meta.ComposeSignal(c, a, idx, weights, cfg.Threshold)
 		}
 		oosTrades := SimulateOOS(oosCandles, params, compose)

@@ -303,20 +303,25 @@ type TaggedSignal struct {
 	Weight float64
 }
 
-// ComposeSignal evaluates every strategy on the given candle and folds their
-// signals into a weighted vote. If the absolute net weight clears
-// threshold, it picks the direction and surfaces the best (highest-weight)
-// individual entry/SL/TP triplet from the winning side as the recommended
-// execution levels.
-func ComposeSignal(candles []core.Candle, a smc.Analysis, i int, weights map[string]float64, threshold float64) CompositeSignal {
+// composeCore aggregates Long/Short weights for every triggering strategy
+// at candle i without making the Recommended decision. Threshold gating is
+// applied by callers via applyThreshold, which makes both the fixed-threshold
+// path (ComposeSignal) and the percentile-threshold path (ComposeSignalDynamic)
+// share one codepath. weightOf is the lookup that lets the same core power
+// both the flat-weights and per-session callers.
+//
+// Returns the in-progress CompositeSignal plus the best-weighted long and
+// short triggers (for applyThreshold to promote into the recommended levels).
+func composeCore(candles []core.Candle, a smc.Analysis, i int, weightOf func(strat, sess string) float64) (CompositeSignal, *TaggedSignal, *TaggedSignal) {
 	cs := CompositeSignal{}
 	var bestLong, bestShort *TaggedSignal
+	sess := core.ClassifySession(candles[i].Time)
 	for _, s := range strategy.All() {
 		sig, ok := s.Detect(candles, a, i)
 		if !ok {
 			continue
 		}
-		w := weights[sig.Strategy]
+		w := weightOf(sig.Strategy, sess)
 		if w <= 0 {
 			continue
 		}
@@ -339,7 +344,14 @@ func ComposeSignal(candles []core.Candle, a smc.Analysis, i int, weights map[str
 	if total > 0 {
 		cs.Confidence = math.Abs(cs.NetWeight) / total
 	}
+	return cs, bestLong, bestShort
+}
 
+// applyThreshold promotes bestLong or bestShort into the recommended slot
+// when |NetWeight| crosses threshold. Mutates cs in place so the same
+// CompositeSignal struct returned from composeCore is the one the caller
+// receives.
+func applyThreshold(cs *CompositeSignal, bestLong, bestShort *TaggedSignal, threshold float64) {
 	if cs.NetWeight >= threshold && bestLong != nil {
 		cs.Side = core.Long
 		cs.Recommended = true
@@ -355,6 +367,18 @@ func ComposeSignal(candles []core.Candle, a smc.Analysis, i int, weights map[str
 		cs.BestTP = bestShort.Signal.TP
 		cs.WinnerStrategy = bestShort.Signal.Strategy
 	}
+}
+
+// ComposeSignal evaluates every strategy on the given candle and folds their
+// signals into a weighted vote. If the absolute net weight clears
+// threshold, it picks the direction and surfaces the best (highest-weight)
+// individual entry/SL/TP triplet from the winning side as the recommended
+// execution levels.
+func ComposeSignal(candles []core.Candle, a smc.Analysis, i int, weights map[string]float64, threshold float64) CompositeSignal {
+	cs, bL, bS := composeCore(candles, a, i, func(strat, _ string) float64 {
+		return weights[strat]
+	})
+	applyThreshold(&cs, bL, bS, threshold)
 	return cs
 }
 
@@ -366,55 +390,62 @@ func ComposeSignal(candles []core.Candle, a smc.Analysis, i int, weights map[str
 // Same threshold and best-entry tie-break as ComposeSignal; only the weight
 // lookup differs.
 func ComposeSignalBySession(candles []core.Candle, a smc.Analysis, i int, weightsBySession map[string]map[string]float64, threshold float64) CompositeSignal {
-	cs := CompositeSignal{}
-	var bestLong, bestShort *TaggedSignal
-	sess := core.ClassifySession(candles[i].Time)
-	for _, s := range strategy.All() {
-		sig, ok := s.Detect(candles, a, i)
-		if !ok {
-			continue
+	cs, bL, bS := composeCore(candles, a, i, func(strat, sess string) float64 {
+		if perSess, ok := weightsBySession[strat]; ok {
+			return perSess[sess]
 		}
-		w := 0.0
-		if perSess, ok := weightsBySession[sig.Strategy]; ok {
-			w = perSess[sess]
-		}
-		if w <= 0 {
-			continue
-		}
-		ts := TaggedSignal{Signal: sig, Weight: w}
-		cs.Triggers = append(cs.Triggers, ts)
-		if sig.Side == core.Long {
-			cs.LongWeight += w
-			if bestLong == nil || w > bestLong.Weight {
-				bestLong = &ts
-			}
-		} else {
-			cs.ShortWeight += w
-			if bestShort == nil || w > bestShort.Weight {
-				bestShort = &ts
-			}
-		}
+		return 0
+	})
+	applyThreshold(&cs, bL, bS, threshold)
+	return cs
+}
+
+// ComposeSignalDynamic is the percentile-threshold companion to ComposeSignal.
+// Instead of a hard-coded threshold it derives the gate at each call from
+// the upper-tail percentile of |NetWeight| observations stored in buf —
+// so the system trades the same upper fraction of decisive setups regardless
+// of regime. Active observations (where at least one strategy fired) are
+// pushed; quiet candles are skipped so the percentile reflects active-signal
+// strength, not noise.
+//
+// When buf is empty the threshold collapses to 0 and the first non-zero
+// observation will trigger; subsequent calls progressively raise the gate
+// as the empirical distribution fills in. Callers concerned about cold-start
+// should warm the buffer (e.g., on the IS slice of a WFA window) before
+// gating any decision.
+func ComposeSignalDynamic(candles []core.Candle, a smc.Analysis, i int, weights map[string]float64, percentile float64, buf *ThresholdBuffer) CompositeSignal {
+	cs, bL, bS := composeCore(candles, a, i, func(strat, _ string) float64 {
+		return weights[strat]
+	})
+	if buf != nil && (cs.LongWeight+cs.ShortWeight) > 0 {
+		buf.Push(math.Abs(cs.NetWeight))
 	}
-	cs.NetWeight = cs.LongWeight - cs.ShortWeight
-	total := cs.LongWeight + cs.ShortWeight
-	if total > 0 {
-		cs.Confidence = math.Abs(cs.NetWeight) / total
+	threshold := 0.0
+	if buf != nil {
+		threshold = buf.Percentile(percentile)
 	}
-	if cs.NetWeight >= threshold && bestLong != nil {
-		cs.Side = core.Long
-		cs.Recommended = true
-		cs.BestEntry = bestLong.Signal.Entry
-		cs.BestSL = bestLong.Signal.SL
-		cs.BestTP = bestLong.Signal.TP
-		cs.WinnerStrategy = bestLong.Signal.Strategy
-	} else if -cs.NetWeight >= threshold && bestShort != nil {
-		cs.Side = core.Short
-		cs.Recommended = true
-		cs.BestEntry = bestShort.Signal.Entry
-		cs.BestSL = bestShort.Signal.SL
-		cs.BestTP = bestShort.Signal.TP
-		cs.WinnerStrategy = bestShort.Signal.Strategy
+	applyThreshold(&cs, bL, bS, threshold)
+	return cs
+}
+
+// ComposeSignalBySessionDynamic is the per-session-aware companion to
+// ComposeSignalDynamic — same percentile-gate behavior, per-session weight
+// lookup. See ComposeSignalBySession for the rationale of per-session weights.
+func ComposeSignalBySessionDynamic(candles []core.Candle, a smc.Analysis, i int, weightsBySession map[string]map[string]float64, percentile float64, buf *ThresholdBuffer) CompositeSignal {
+	cs, bL, bS := composeCore(candles, a, i, func(strat, sess string) float64 {
+		if perSess, ok := weightsBySession[strat]; ok {
+			return perSess[sess]
+		}
+		return 0
+	})
+	if buf != nil && (cs.LongWeight+cs.ShortWeight) > 0 {
+		buf.Push(math.Abs(cs.NetWeight))
 	}
+	threshold := 0.0
+	if buf != nil {
+		threshold = buf.Percentile(percentile)
+	}
+	applyThreshold(&cs, bL, bS, threshold)
 	return cs
 }
 

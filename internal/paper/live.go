@@ -24,20 +24,21 @@ import (
 // the next interval boundary" (the natural cadence for closed-candle
 // trading and the safest one for free-tier API quotas).
 type LiveConfig struct {
-	SourceRunID      int64
-	BySession        bool
-	Symbol           string
-	Interval         string
-	Threshold        float64
-	UseBias          bool
-	ATRMult          float64
-	H4Period         int
-	PDLookback       int
-	Slippage         float64
-	SlippageNewsMult float64
-	PollSeconds      int
-	APIKey           string
-	HTTPClient       *http.Client
+	SourceRunID         int64
+	BySession           bool
+	Symbol              string
+	Interval            string
+	Threshold           float64
+	ThresholdPercentile float64 // > 0 enables dynamic percentile gate; ignores Threshold
+	UseBias             bool
+	ATRMult             float64
+	H4Period            int
+	PDLookback          int
+	Slippage            float64
+	SlippageNewsMult    float64
+	PollSeconds         int
+	APIKey              string
+	HTTPClient          *http.Client
 }
 
 // pendingPosition mirrors a paper_pending row for in-memory grading. We
@@ -234,13 +235,31 @@ func buildLiveParams(cfg LiveConfig) engine.BacktestParams {
 }
 
 func buildComposer(cfg LiveConfig, weights map[string]float64, weightsBySession map[string]map[string]float64) func([]core.Candle, smc.Analysis, int) meta.CompositeSignal {
-	if cfg.BySession {
+	// Dynamic-percentile mode: keep a buffer alive across iterations so the
+	// rolling |NetWeight| distribution carries over poll-to-poll. The
+	// closure capture is the only reason a sessions-long buffer survives —
+	// callers must not reuse a closure across runs.
+	var buf *meta.ThresholdBuffer
+	if cfg.ThresholdPercentile > 0 {
+		buf = meta.NewThresholdBuffer(meta.DefaultThresholdBufferCap)
+	}
+	switch {
+	case cfg.BySession && buf != nil:
+		return func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
+			return meta.ComposeSignalBySessionDynamic(c, a, i, weightsBySession, cfg.ThresholdPercentile, buf)
+		}
+	case cfg.BySession:
 		return func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
 			return meta.ComposeSignalBySession(c, a, i, weightsBySession, cfg.Threshold)
 		}
-	}
-	return func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
-		return meta.ComposeSignal(c, a, i, weights, cfg.Threshold)
+	case buf != nil:
+		return func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
+			return meta.ComposeSignalDynamic(c, a, i, weights, cfg.ThresholdPercentile, buf)
+		}
+	default:
+		return func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
+			return meta.ComposeSignal(c, a, i, weights, cfg.Threshold)
+		}
 	}
 }
 

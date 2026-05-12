@@ -429,11 +429,16 @@ func runSignal(args []string) int {
 	paperRun := fs.String("paper-run", "", "comma-separated paper_runs.id list to UNION into the weight calc")
 	symbol := fs.String("symbol", "XAU/USD", "symbol")
 	interval := fs.String("interval", "15m", "interval to evaluate")
-	threshold := fs.Float64("threshold", 2.0, "min |net weight| required to recommend")
+	threshold := fs.Float64("threshold", 2.0, "min |net weight| required to recommend (ignored when -threshold-percentile > 0)")
+	thresholdPct := fs.Float64("threshold-percentile", 0, "if > 0, gate by the upper-tail percentile of the rolling |NetWeight| distribution; mutually exclusive with -threshold")
 	capital := fs.Float64("capital", 0, "USD to risk; if >0, compute Admirals units & margin")
 	scanBack := fs.Int("scan-back", 0, "also scan the last N candles for any recommended signals")
 	bySession := fs.Bool("by-session", false, "use per-session weights instead of the global table")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *thresholdPct < 0 || *thresholdPct > 1 {
+		fmt.Fprintln(os.Stderr, "-threshold-percentile must be in [0, 1]")
 		return 2
 	}
 	paperRunIDs, err := parsePaperRunIDs(*paperRun)
@@ -471,6 +476,13 @@ func runSignal(args []string) int {
 
 	// Two compose modes share the rest of the runSignal loop. compose is
 	// closed over either weights map so the call site stays uniform.
+	// Dynamic-percentile mode keeps a single buffer alive through the
+	// warm-up loop and the scan, so the threshold reflects the rolling
+	// distribution observed in the loaded history.
+	var buf *meta.ThresholdBuffer
+	if *thresholdPct > 0 {
+		buf = meta.NewThresholdBuffer(meta.DefaultThresholdBufferCap)
+	}
 	var compose func(i int) meta.CompositeSignal
 	if *bySession {
 		ws, err := meta.LoadWeightsBySession(ctx, pool, id, paperRunIDs...)
@@ -478,8 +490,14 @@ func runSignal(args []string) int {
 			fmt.Fprintf(os.Stderr, "load weights-by-session: %v\n", err)
 			return 1
 		}
-		compose = func(i int) meta.CompositeSignal {
-			return meta.ComposeSignalBySession(candles, a, i, ws, *threshold)
+		if buf != nil {
+			compose = func(i int) meta.CompositeSignal {
+				return meta.ComposeSignalBySessionDynamic(candles, a, i, ws, *thresholdPct, buf)
+			}
+		} else {
+			compose = func(i int) meta.CompositeSignal {
+				return meta.ComposeSignalBySession(candles, a, i, ws, *threshold)
+			}
 		}
 	} else {
 		ws, err := meta.LoadWeights(ctx, pool, id, paperRunIDs...)
@@ -488,14 +506,37 @@ func runSignal(args []string) int {
 			return 1
 		}
 		weights := meta.WeightMap(ws)
-		compose = func(i int) meta.CompositeSignal {
-			return meta.ComposeSignal(candles, a, i, weights, *threshold)
+		if buf != nil {
+			compose = func(i int) meta.CompositeSignal {
+				return meta.ComposeSignalDynamic(candles, a, i, weights, *thresholdPct, buf)
+			}
+		} else {
+			compose = func(i int) meta.CompositeSignal {
+				return meta.ComposeSignal(candles, a, i, weights, *threshold)
+			}
+		}
+	}
+
+	// Warm the percentile buffer with the rolling window before evaluating
+	// the current candle. Without this the first call would see an empty
+	// distribution and always trigger. The warm-up window is the buffer
+	// capacity (DefaultThresholdBufferCap ≈ 1 week of 5m); recently-pruned
+	// candles fall out naturally as the ring buffer wraps.
+	if buf != nil {
+		warmStart := len(candles) - 1 - meta.DefaultThresholdBufferCap
+		warmStart = max(warmStart, 0)
+		for i := warmStart; i < len(candles)-1; i++ {
+			compose(i)
 		}
 	}
 
 	// Always report the current candle.
 	cs := compose(len(candles) - 1)
-	meta.PrintCompositeSignal(*symbol, *interval, candles[len(candles)-1], cs, id, *threshold, *capital)
+	displayThreshold := *threshold
+	if buf != nil {
+		displayThreshold = buf.Percentile(*thresholdPct)
+	}
+	meta.PrintCompositeSignal(*symbol, *interval, candles[len(candles)-1], cs, id, displayThreshold, *capital)
 
 	// Optional: walk back N candles looking for the most recent
 	// recommended (threshold-crossing) signal — useful when "now" is quiet.
@@ -534,7 +575,8 @@ func runWFA(args []string) int {
 	is := fs.Int("is-months", 6, "in-sample window months")
 	oos := fs.Int("oos-months", 2, "out-of-sample window months")
 	step := fs.Int("step-months", 2, "rolling step in months")
-	threshold := fs.Float64("threshold", 2.0, "composite |NetWeight| threshold for OOS")
+	threshold := fs.Float64("threshold", 2.0, "composite |NetWeight| threshold for OOS (ignored when -threshold-percentile > 0)")
+	thresholdPct := fs.Float64("threshold-percentile", 0, "if > 0, gate by the upper-tail percentile (e.g. 0.95) of the per-window |NetWeight| distribution; mutually exclusive with -threshold")
 	useBias := fs.Bool("bias", true, "apply H4 EMA bias filter inside each window")
 	atrMult := fs.Float64("atr-mult", 1.5, "ATR SL widening multiplier (0 disables)")
 	h4Period := fs.Int("h4-period", 200, "EMA period for the H4 bias")
@@ -543,6 +585,10 @@ func runWFA(args []string) int {
 	slippageNewsMult := fs.Float64("slippage-news-mult", 1.0, "multiplier applied to slippage in news windows")
 	persist := fs.Bool("persist", false, "store this WFA run + every OOS trade in wfa_runs/wfa_trades")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *thresholdPct < 0 || *thresholdPct > 1 {
+		fmt.Fprintln(os.Stderr, "-threshold-percentile must be in [0, 1]")
 		return 2
 	}
 
@@ -557,10 +603,14 @@ func runWFA(args []string) int {
 	cfg := wfa.WFAConfig{
 		Symbol: *symbol, Interval: *interval,
 		ISWindowMonths: *is, OOSWindowMonths: *oos, StepMonths: *step,
-		Threshold: *threshold, UseBias: *useBias, ATRMult: *atrMult, H4Period: *h4Period,
-		PDLookback:       *pdLookback,
-		Slippage:         *slippage,
-		SlippageNewsMult: *slippageNewsMult,
+		Threshold:           *threshold,
+		ThresholdPercentile: *thresholdPct,
+		UseBias:             *useBias,
+		ATRMult:             *atrMult,
+		H4Period:            *h4Period,
+		PDLookback:          *pdLookback,
+		Slippage:            *slippage,
+		SlippageNewsMult:    *slippageNewsMult,
 	}
 	candles, err := loadCandles(ctx, pool, cfg.Symbol, cfg.Interval, cfg.StartDate, cfg.EndDate)
 	if err != nil {
@@ -582,8 +632,12 @@ func runWFA(args []string) int {
 	}
 
 	fmt.Printf("\n═══ Walk-Forward Analysis — %s %s ═══\n", *symbol, *interval)
-	fmt.Printf("  IS=%dmo  OOS=%dmo  step=%dmo  threshold=%.2f  bias=%t  atrMult=%.2f\n\n",
-		*is, *oos, *step, *threshold, *useBias, *atrMult)
+	gate := fmt.Sprintf("threshold=%.2f", *threshold)
+	if *thresholdPct > 0 {
+		gate = fmt.Sprintf("threshold-percentile=%.2f", *thresholdPct)
+	}
+	fmt.Printf("  IS=%dmo  OOS=%dmo  step=%dmo  %s  bias=%t  atrMult=%.2f\n\n",
+		*is, *oos, *step, gate, *useBias, *atrMult)
 	fmt.Printf("  %-3s  %-19s  %-19s  %-5s  %-7s  %-7s  %-7s\n",
 		"#", "OOS Start", "OOS End", "N", "WR%", "NetR", "Sharpe")
 	for i, w := range res.Windows {
@@ -719,7 +773,8 @@ func runPaperReplay(args []string) int {
 	interval := fs.String("interval", "15m", "interval to replay")
 	fromStr := fs.String("from", "", "lower bound (YYYY-MM-DD); empty = full history")
 	toStr := fs.String("to", "", "upper bound (YYYY-MM-DD); empty = up to now")
-	threshold := fs.Float64("threshold", 2.0, "composite |NetWeight| threshold for an entry")
+	threshold := fs.Float64("threshold", 2.0, "composite |NetWeight| threshold for an entry (ignored when -threshold-percentile > 0)")
+	thresholdPct := fs.Float64("threshold-percentile", 0, "if > 0, gate by the upper-tail percentile of the rolling |NetWeight| distribution; mutually exclusive with -threshold")
 	useBias := fs.Bool("bias", false, "apply H4 EMA bias filter")
 	atrMult := fs.Float64("atr-mult", 0, "ATR SL widening multiplier (0 disables)")
 	h4Period := fs.Int("h4-period", 200, "EMA period for the H4 bias")
@@ -729,6 +784,10 @@ func runPaperReplay(args []string) int {
 	bySession := fs.Bool("by-session", false, "use per-session weight table instead of the global one")
 	persist := fs.Bool("persist", false, "store this paper run + every trade in paper_runs/paper_trades")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *thresholdPct < 0 || *thresholdPct > 1 {
+		fmt.Fprintln(os.Stderr, "-threshold-percentile must be in [0, 1]")
 		return 2
 	}
 	paperRunIDs, err := parsePaperRunIDs(*paperRun)
@@ -792,11 +851,16 @@ func runPaperReplay(args []string) int {
 	cfg := paper.Config{
 		SourceRunID: id, BySession: *bySession,
 		Symbol: *symbol, Interval: *interval,
-		StartDate: from, EndDate: to,
-		Threshold: *threshold, UseBias: *useBias, ATRMult: *atrMult, H4Period: *h4Period,
-		PDLookback:       *pdLookback,
-		Slippage:         *slippage,
-		SlippageNewsMult: *slippageNewsMult,
+		StartDate:           from,
+		EndDate:             to,
+		Threshold:           *threshold,
+		ThresholdPercentile: *thresholdPct,
+		UseBias:             *useBias,
+		ATRMult:             *atrMult,
+		H4Period:            *h4Period,
+		PDLookback:          *pdLookback,
+		Slippage:            *slippage,
+		SlippageNewsMult:    *slippageNewsMult,
 	}
 
 	var (
@@ -821,8 +885,12 @@ func runPaperReplay(args []string) int {
 	res := paper.Replay(cfg, candles, h4Candles, flat, bySessTbl)
 
 	fmt.Printf("\n═══ Paper Replay — %s %s ═══\n", *symbol, *interval)
-	fmt.Printf("  Source: backtest_runs.id=%d  ·  bySession=%t  ·  threshold=%.2f  ·  bias=%t  ·  atrMult=%.2f\n",
-		id, *bySession, *threshold, *useBias, *atrMult)
+	gate := fmt.Sprintf("threshold=%.2f", *threshold)
+	if *thresholdPct > 0 {
+		gate = fmt.Sprintf("threshold-percentile=%.2f", *thresholdPct)
+	}
+	fmt.Printf("  Source: backtest_runs.id=%d  ·  bySession=%t  ·  %s  ·  bias=%t  ·  atrMult=%.2f\n",
+		id, *bySession, gate, *useBias, *atrMult)
 	fmt.Printf("  Range: %s → %s  (%d candles)\n\n",
 		candles[0].Time.Format("2006-01-02 15:04"),
 		candles[len(candles)-1].Time.Format("2006-01-02 15:04"),
@@ -881,13 +949,18 @@ func runPaperLive(args []string) int {
 	paperRun := fs.String("paper-run", "", "comma-separated paper_runs.id list to UNION into the weight calc")
 	symbol := fs.String("symbol", "XAU/USD", "symbol to trade")
 	interval := fs.String("interval", "15m", "candle interval (15m/1h/4h)")
-	threshold := fs.Float64("threshold", 2.0, "composite |NetWeight| threshold for an entry")
+	threshold := fs.Float64("threshold", 2.0, "composite |NetWeight| threshold for an entry (ignored when -threshold-percentile > 0)")
+	thresholdPct := fs.Float64("threshold-percentile", 0, "if > 0, gate by the upper-tail percentile of the rolling |NetWeight| distribution; mutually exclusive with -threshold")
 	pdLookback := fs.Int("pd-lookback", 96, "Premium/Discount filter lookback in candles (0 disables, 96 = 24h on 15m)")
 	slippage := fs.Float64("slippage", 0, "SL slippage in dollars (0 disables)")
 	slippageNewsMult := fs.Float64("slippage-news-mult", 1.0, "multiplier applied to slippage in news windows")
 	bySession := fs.Bool("by-session", false, "use per-session weight table instead of the global one")
 	pollSeconds := fs.Int("poll-seconds", 0, "fixed poll cadence in seconds; 0 = align to interval boundary (recommended for free tier)")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *thresholdPct < 0 || *thresholdPct > 1 {
+		fmt.Fprintln(os.Stderr, "-threshold-percentile must be in [0, 1]")
 		return 2
 	}
 	paperRunIDs, err := parsePaperRunIDs(*paperRun)
@@ -949,18 +1022,23 @@ func runPaperLive(args []string) int {
 	cfg := paper.LiveConfig{
 		SourceRunID: id, BySession: *bySession,
 		Symbol: *symbol, Interval: *interval,
-		Threshold:        *threshold,
-		PDLookback:       *pdLookback,
-		Slippage:         *slippage,
-		SlippageNewsMult: *slippageNewsMult,
-		PollSeconds:      *pollSeconds,
-		APIKey:           apiKey,
-		HTTPClient:       &http.Client{Timeout: 30 * time.Second},
+		Threshold:           *threshold,
+		ThresholdPercentile: *thresholdPct,
+		PDLookback:          *pdLookback,
+		Slippage:            *slippage,
+		SlippageNewsMult:    *slippageNewsMult,
+		PollSeconds:         *pollSeconds,
+		APIKey:              apiKey,
+		HTTPClient:          &http.Client{Timeout: 30 * time.Second},
 	}
 
 	fmt.Printf("═══ Paper Live — %s %s ═══\n", *symbol, *interval)
-	fmt.Printf("  Source weights: backtest_runs.id=%d  ·  bySession=%t  ·  threshold=%.2f\n",
-		id, *bySession, *threshold)
+	gate := fmt.Sprintf("threshold=%.2f", *threshold)
+	if *thresholdPct > 0 {
+		gate = fmt.Sprintf("threshold-percentile=%.2f", *thresholdPct)
+	}
+	fmt.Printf("  Source weights: backtest_runs.id=%d  ·  bySession=%t  ·  %s\n",
+		id, *bySession, gate)
 	if len(paperRunIDs) > 0 {
 		fmt.Printf("  Feedback paper runs: %v\n", paperRunIDs)
 	}

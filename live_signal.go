@@ -28,9 +28,14 @@ func runLiveSignal(args []string) int {
 	symbol := fs.String("symbol", "XAU/USD", "symbol")
 	interval := fs.String("interval", "15m", "candle interval for the signal engine")
 	threshold := fs.Float64("threshold", 2.0, "composite |NetWeight| threshold")
+	thresholdPct := fs.Float64("threshold-percentile", 0, "if > 0, gate by the upper-tail percentile of the rolling |NetWeight| distribution; mutually exclusive with -threshold")
 	pollSeconds := fs.Int("poll-seconds", 30, "REST candle poll cadence")
 	bySession := fs.Bool("by-session", false, "use per-session weights")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *thresholdPct < 0 || *thresholdPct > 1 {
+		fmt.Fprintln(os.Stderr, "-threshold-percentile must be in [0, 1]")
 		return 2
 	}
 	paperRunIDs, err := parsePaperRunIDs(*paperRun)
@@ -63,6 +68,12 @@ func runLiveSignal(args []string) int {
 	}
 
 	// Resolve composer ONCE — the polled goroutine reuses it on every tick.
+	// Dynamic-percentile mode keeps a single ThresholdBuffer alive across
+	// polls so the rolling |NetWeight| distribution accumulates session-long.
+	var buf *meta.ThresholdBuffer
+	if *thresholdPct > 0 {
+		buf = meta.NewThresholdBuffer(meta.DefaultThresholdBufferCap)
+	}
 	var compose func(candles []core.Candle, a smc.Analysis, i int) meta.CompositeSignal
 	if *bySession {
 		ws, err := meta.LoadWeightsBySession(ctx, pool, id, paperRunIDs...)
@@ -70,8 +81,14 @@ func runLiveSignal(args []string) int {
 			fmt.Fprintf(os.Stderr, "load weights-by-session: %v\n", err)
 			return 1
 		}
-		compose = func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
-			return meta.ComposeSignalBySession(c, a, i, ws, *threshold)
+		if buf != nil {
+			compose = func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
+				return meta.ComposeSignalBySessionDynamic(c, a, i, ws, *thresholdPct, buf)
+			}
+		} else {
+			compose = func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
+				return meta.ComposeSignalBySession(c, a, i, ws, *threshold)
+			}
 		}
 	} else {
 		ws, err := meta.LoadWeights(ctx, pool, id, paperRunIDs...)
@@ -80,8 +97,14 @@ func runLiveSignal(args []string) int {
 			return 1
 		}
 		wm := meta.WeightMap(ws)
-		compose = func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
-			return meta.ComposeSignal(c, a, i, wm, *threshold)
+		if buf != nil {
+			compose = func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
+				return meta.ComposeSignalDynamic(c, a, i, wm, *thresholdPct, buf)
+			}
+		} else {
+			compose = func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
+				return meta.ComposeSignal(c, a, i, wm, *threshold)
+			}
 		}
 	}
 
@@ -94,8 +117,12 @@ func runLiveSignal(args []string) int {
 	defer feed.Close()
 
 	fmt.Printf("═══ Live Signal — %s %s ═══\n", *symbol, *interval)
-	fmt.Printf("  Run #%d  threshold=%.2f  poll=%ds  bySession=%t\n\n",
-		id, *threshold, *pollSeconds, *bySession)
+	gate := fmt.Sprintf("threshold=%.2f", *threshold)
+	if buf != nil {
+		gate = fmt.Sprintf("threshold-percentile=%.2f", *thresholdPct)
+	}
+	fmt.Printf("  Run #%d  %s  poll=%ds  bySession=%t\n\n",
+		id, gate, *pollSeconds, *bySession)
 
 	go printTicks(ctx, feed)
 

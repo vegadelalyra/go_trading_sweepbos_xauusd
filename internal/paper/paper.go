@@ -35,19 +35,20 @@ import (
 // per-session table) and the engine knobs mirror the backtest/WFA flags
 // for parity.
 type Config struct {
-	SourceRunID      int64     // backtest_runs.id the weights came from
-	BySession        bool      // true if weights are per-session
-	Symbol           string
-	Interval         string
-	StartDate        time.Time // zero = first available candle
-	EndDate          time.Time // zero = last available candle
-	Threshold        float64
-	UseBias          bool
-	ATRMult          float64
-	H4Period         int
-	PDLookback       int
-	Slippage         float64
-	SlippageNewsMult float64
+	SourceRunID         int64 // backtest_runs.id the weights came from
+	BySession           bool  // true if weights are per-session
+	Symbol              string
+	Interval            string
+	StartDate           time.Time // zero = first available candle
+	EndDate             time.Time // zero = last available candle
+	Threshold           float64
+	ThresholdPercentile float64 // > 0 enables dynamic percentile gate; ignores Threshold
+	UseBias             bool
+	ATRMult             float64
+	H4Period            int
+	PDLookback          int
+	Slippage            float64
+	SlippageNewsMult    float64
 }
 
 // Result holds the trades produced by the replay plus aggregate stats over
@@ -80,13 +81,29 @@ func Replay(cfg Config, candles []core.Candle, h4Candles []core.Candle,
 	params.SlippageNewsMult = cfg.SlippageNewsMult
 
 	// Build the composer once: the closure captures the chosen weight
-	// surface, and wfa.SimulateOOS calls it for every candle.
+	// surface, and wfa.SimulateOOS calls it for every candle. When the
+	// dynamic-percentile gate is enabled (cfg.ThresholdPercentile > 0), a
+	// fresh ThresholdBuffer is held by the closure so the running
+	// distribution of |NetWeight| informs each candle's gate.
+	var buf *meta.ThresholdBuffer
+	if cfg.ThresholdPercentile > 0 {
+		buf = meta.NewThresholdBuffer(meta.DefaultThresholdBufferCap)
+	}
 	var compose wfa.Composer
-	if cfg.BySession {
+	switch {
+	case cfg.BySession && buf != nil:
+		compose = func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
+			return meta.ComposeSignalBySessionDynamic(c, a, i, weightsBySession, cfg.ThresholdPercentile, buf)
+		}
+	case cfg.BySession:
 		compose = func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
 			return meta.ComposeSignalBySession(c, a, i, weightsBySession, cfg.Threshold)
 		}
-	} else {
+	case buf != nil:
+		compose = func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
+			return meta.ComposeSignalDynamic(c, a, i, weights, cfg.ThresholdPercentile, buf)
+		}
+	default:
 		compose = func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
 			return meta.ComposeSignal(c, a, i, weights, cfg.Threshold)
 		}
