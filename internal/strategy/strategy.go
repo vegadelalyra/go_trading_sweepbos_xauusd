@@ -63,3 +63,40 @@ func IsBreakout(name string) bool {
 	}
 	return false
 }
+
+// IsLondonFixMomentum reports whether a strategy is a momentum/breakout
+// setup that should be PENALISED inside the London Gold Fix window
+// (14:40-15:20 UTC). The intuition is identical to IsBreakout but the
+// list also includes BreakerBlock — a continuation setup that, while not
+// a pure breakout, still bets on directional follow-through, exactly the
+// regime the 15:00 GMT fix manipulation disrupts.
+//
+// Distinct from IsBreakout: that predicate gates the SMC Premium/Discount
+// filter (structural — only true breakouts qualify); this one gates the
+// London Fix weight adjustment (behavioral — any "fade me at extremes"
+// setup belongs here).
+func IsLondonFixMomentum(name string) bool {
+	switch name {
+	case "DailyBreakout", "AsianRangeBO", "BreakerBlock":
+		return true
+	}
+	return false
+}
+
+// IsLiquidityFade reports whether a strategy is a liquidity-fade setup
+// designed to profit from the Judas-swing / stop-hunt → mean-reversion
+// pattern. These strategies BENEFIT from the manipulation that hurts
+// momentum plays around the 15:00 GMT London Gold Fix, so the London Fix
+// filter boosts their weight inside the window rather than penalising it.
+//
+// The list mirrors the four "smart-money fade" strategies in the catalog:
+// JudasSwing (the textbook fade), TurtleSoup (Larry Williams' fade of
+// false breakouts), LiquiditySweepBoS (sweep-then-BoS), and SilverBullet
+// (the 10-11 NY hour scalp that often catches the fix-window snap-back).
+func IsLiquidityFade(name string) bool {
+	switch name {
+	case "JudasSwing", "TurtleSoup", "LiquiditySweepBoS", "SilverBullet":
+		return true
+	}
+	return false
+}

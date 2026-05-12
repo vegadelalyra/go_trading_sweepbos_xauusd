@@ -93,19 +93,19 @@ func Replay(cfg Config, candles []core.Candle, h4Candles []core.Candle,
 	switch {
 	case cfg.BySession && buf != nil:
 		compose = func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
-			return meta.ComposeSignalBySessionDynamic(c, a, i, weightsBySession, cfg.ThresholdPercentile, buf)
+			return meta.ComposeSignalBySessionDynamic(c, a, i, weightsBySession, cfg.ThresholdPercentile, buf, meta.LondonFixConfig{})
 		}
 	case cfg.BySession:
 		compose = func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
-			return meta.ComposeSignalBySession(c, a, i, weightsBySession, cfg.Threshold)
+			return meta.ComposeSignalBySession(c, a, i, weightsBySession, cfg.Threshold, meta.LondonFixConfig{})
 		}
 	case buf != nil:
 		compose = func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
-			return meta.ComposeSignalDynamic(c, a, i, weights, cfg.ThresholdPercentile, buf)
+			return meta.ComposeSignalDynamic(c, a, i, weights, cfg.ThresholdPercentile, buf, meta.LondonFixConfig{})
 		}
 	default:
 		compose = func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
-			return meta.ComposeSignal(c, a, i, weights, cfg.Threshold)
+			return meta.ComposeSignal(c, a, i, weights, cfg.Threshold, meta.LondonFixConfig{})
 		}
 	}
 

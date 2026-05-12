@@ -39,6 +39,10 @@ type LiveConfig struct {
 	PollSeconds         int
 	APIKey              string
 	HTTPClient          *http.Client
+	// LondonFix toggles the 15:00 GMT London Gold Fix session adjustment
+	// at vote time. Zero-value (Enabled=false) is a no-op — every legacy
+	// paper-live run stays bit-for-bit identical until London Fix is opted in.
+	LondonFix meta.LondonFixConfig
 }
 
 // pendingPosition mirrors a paper_pending row for in-memory grading. We
@@ -79,8 +83,12 @@ func RunLive(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig,
 	if err != nil {
 		return 0, fmt.Errorf("create live run: %w", err)
 	}
-	log.Log("paper_runs.id=%d created (live mode, source backtest_runs.id=%d, bySession=%t, threshold=%.2f)",
-		paperRunID, cfg.SourceRunID, cfg.BySession, cfg.Threshold)
+	gateLabel := fmt.Sprintf("threshold=%.2f", cfg.Threshold)
+	if cfg.ThresholdPercentile > 0 {
+		gateLabel = fmt.Sprintf("threshold-percentile=%.2f (dynamic)", cfg.ThresholdPercentile)
+	}
+	log.Log("paper_runs.id=%d created (live mode, source backtest_runs.id=%d, bySession=%t, %s)",
+		paperRunID, cfg.SourceRunID, cfg.BySession, gateLabel)
 
 	// Compose function is closed over the weight table chosen at startup.
 	// Re-evaluating weights every poll is overkill — the underlying
@@ -248,19 +256,19 @@ func buildComposer(cfg LiveConfig, weights map[string]float64, weightsBySession 
 	switch {
 	case cfg.BySession && buf != nil:
 		return func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
-			return meta.ComposeSignalBySessionDynamic(c, a, i, weightsBySession, cfg.ThresholdPercentile, buf)
+			return meta.ComposeSignalBySessionDynamic(c, a, i, weightsBySession, cfg.ThresholdPercentile, buf, cfg.LondonFix)
 		}
 	case cfg.BySession:
 		return func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
-			return meta.ComposeSignalBySession(c, a, i, weightsBySession, cfg.Threshold)
+			return meta.ComposeSignalBySession(c, a, i, weightsBySession, cfg.Threshold, cfg.LondonFix)
 		}
 	case buf != nil:
 		return func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
-			return meta.ComposeSignalDynamic(c, a, i, weights, cfg.ThresholdPercentile, buf)
+			return meta.ComposeSignalDynamic(c, a, i, weights, cfg.ThresholdPercentile, buf, cfg.LondonFix)
 		}
 	default:
 		return func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
-			return meta.ComposeSignal(c, a, i, weights, cfg.Threshold)
+			return meta.ComposeSignal(c, a, i, weights, cfg.Threshold, cfg.LondonFix)
 		}
 	}
 }

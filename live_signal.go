@@ -83,11 +83,11 @@ func runLiveSignal(args []string) int {
 		}
 		if buf != nil {
 			compose = func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
-				return meta.ComposeSignalBySessionDynamic(c, a, i, ws, *thresholdPct, buf)
+				return meta.ComposeSignalBySessionDynamic(c, a, i, ws, *thresholdPct, buf, meta.LondonFixConfig{})
 			}
 		} else {
 			compose = func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
-				return meta.ComposeSignalBySession(c, a, i, ws, *threshold)
+				return meta.ComposeSignalBySession(c, a, i, ws, *threshold, meta.LondonFixConfig{})
 			}
 		}
 	} else {
@@ -99,11 +99,11 @@ func runLiveSignal(args []string) int {
 		wm := meta.WeightMap(ws)
 		if buf != nil {
 			compose = func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
-				return meta.ComposeSignalDynamic(c, a, i, wm, *thresholdPct, buf)
+				return meta.ComposeSignalDynamic(c, a, i, wm, *thresholdPct, buf, meta.LondonFixConfig{})
 			}
 		} else {
 			compose = func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
-				return meta.ComposeSignal(c, a, i, wm, *threshold)
+				return meta.ComposeSignal(c, a, i, wm, *threshold, meta.LondonFixConfig{})
 			}
 		}
 	}

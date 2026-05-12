@@ -385,6 +385,54 @@ func parsePaperRunIDs(s string) ([]int64, error) {
 	return out, nil
 }
 
+// parseHHMM parses an "hh:mm" UTC time-of-day string into (hour, minute).
+// Used by the London Fix CLI flags to populate meta.LondonFixConfig.
+func parseHHMM(s string) (int, int, error) {
+	parts := strings.Split(strings.TrimSpace(s), ":")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid hh:mm %q: want \"HH:MM\"", s)
+	}
+	h, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil || h < 0 || h > 23 {
+		return 0, 0, fmt.Errorf("invalid hour in %q: 0..23 required", s)
+	}
+	m, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil || m < 0 || m > 59 {
+		return 0, 0, fmt.Errorf("invalid minute in %q: 0..59 required", s)
+	}
+	return h, m, nil
+}
+
+// buildLondonFixConfig assembles a meta.LondonFixConfig from the
+// per-subcommand CLI flags. When `enabled` is false the helper still
+// validates the hh:mm strings (so a typo surfaces immediately) but
+// returns a zero-value Enabled=false config — a strict no-op downstream.
+func buildLondonFixConfig(enabled bool, start, end string, momMult, fadeMult float64) (meta.LondonFixConfig, error) {
+	sh, sm, err := parseHHMM(start)
+	if err != nil {
+		return meta.LondonFixConfig{}, fmt.Errorf("-london-fix-start: %w", err)
+	}
+	eh, em, err := parseHHMM(end)
+	if err != nil {
+		return meta.LondonFixConfig{}, fmt.Errorf("-london-fix-end: %w", err)
+	}
+	if momMult < 0 {
+		return meta.LondonFixConfig{}, fmt.Errorf("-london-fix-momentum-mult must be >= 0")
+	}
+	if fadeMult < 0 {
+		return meta.LondonFixConfig{}, fmt.Errorf("-london-fix-fade-mult must be >= 0")
+	}
+	return meta.LondonFixConfig{
+		Enabled:      enabled,
+		StartHour:    sh,
+		StartMin:     sm,
+		EndHour:      eh,
+		EndMin:       em,
+		MomentumMult: momMult,
+		FadeMult:     fadeMult,
+	}, nil
+}
+
 func runWeights(args []string) int {
 	fs := flag.NewFlagSet("weights", flag.ContinueOnError)
 	runID := fs.Int64("run-id", 0, "backtest_runs.id to source weights from (0 = latest)")
@@ -493,11 +541,11 @@ func runSignal(args []string) int {
 		}
 		if buf != nil {
 			compose = func(i int) meta.CompositeSignal {
-				return meta.ComposeSignalBySessionDynamic(candles, a, i, ws, *thresholdPct, buf)
+				return meta.ComposeSignalBySessionDynamic(candles, a, i, ws, *thresholdPct, buf, meta.LondonFixConfig{})
 			}
 		} else {
 			compose = func(i int) meta.CompositeSignal {
-				return meta.ComposeSignalBySession(candles, a, i, ws, *threshold)
+				return meta.ComposeSignalBySession(candles, a, i, ws, *threshold, meta.LondonFixConfig{})
 			}
 		}
 	} else {
@@ -509,11 +557,11 @@ func runSignal(args []string) int {
 		weights := meta.WeightMap(ws)
 		if buf != nil {
 			compose = func(i int) meta.CompositeSignal {
-				return meta.ComposeSignalDynamic(candles, a, i, weights, *thresholdPct, buf)
+				return meta.ComposeSignalDynamic(candles, a, i, weights, *thresholdPct, buf, meta.LondonFixConfig{})
 			}
 		} else {
 			compose = func(i int) meta.CompositeSignal {
-				return meta.ComposeSignal(candles, a, i, weights, *threshold)
+				return meta.ComposeSignal(candles, a, i, weights, *threshold, meta.LondonFixConfig{})
 			}
 		}
 	}
@@ -589,12 +637,22 @@ func runWFA(args []string) int {
 	tbTimeStopCandles := fs.Int("tb-time-stop-candles", 8, "triple-barrier: bars after which the dynamic time-stop becomes eligible")
 	tbTimeStopRangeR := fs.Float64("tb-time-stop-r", 0.3, "triple-barrier: |R| band that classifies the position as stagnating")
 	bayesShrink := fs.Bool("bayes-shrink", false, "Bayesian shrinkage of per-strategy RR fitted on IS, applied to OOS (Phase 2.1)")
+	londonFix := fs.Bool("london-fix", false, "apply the London Gold Fix session adjustment (Phase 3.1): momentum ×0.3 / fade ×1.5 inside the window")
+	londonFixStart := fs.String("london-fix-start", "14:40", "UTC start of the London Fix window (HH:MM)")
+	londonFixEnd := fs.String("london-fix-end", "15:20", "UTC end of the London Fix window (HH:MM)")
+	londonFixMomMult := fs.Float64("london-fix-momentum-mult", 0.3, "weight multiplier for momentum strategies inside the window (0 silences them)")
+	londonFixFadeMult := fs.Float64("london-fix-fade-mult", 1.5, "weight multiplier for liquidity-fade strategies inside the window (1.0 = neutral)")
 	persist := fs.Bool("persist", false, "store this WFA run + every OOS trade in wfa_runs/wfa_trades")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if *thresholdPct < 0 || *thresholdPct > 1 {
 		fmt.Fprintln(os.Stderr, "-threshold-percentile must be in [0, 1]")
+		return 2
+	}
+	lfCfg, err := buildLondonFixConfig(*londonFix, *londonFixStart, *londonFixEnd, *londonFixMomMult, *londonFixFadeMult)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
 
@@ -624,6 +682,7 @@ func runWFA(args []string) int {
 			TimeStopRangeR:  *tbTimeStopRangeR,
 		},
 		BayesShrink: *bayesShrink,
+		LondonFix:   lfCfg,
 	}
 	candles, err := loadCandles(ctx, pool, cfg.Symbol, cfg.Interval, cfg.StartDate, cfg.EndDate)
 	if err != nil {
@@ -649,8 +708,13 @@ func runWFA(args []string) int {
 	if *thresholdPct > 0 {
 		gate = fmt.Sprintf("threshold-percentile=%.2f", *thresholdPct)
 	}
-	fmt.Printf("  IS=%dmo  OOS=%dmo  step=%dmo  %s  bias=%t  atrMult=%.2f\n\n",
+	fmt.Printf("  IS=%dmo  OOS=%dmo  step=%dmo  %s  bias=%t  atrMult=%.2f\n",
 		*is, *oos, *step, gate, *useBias, *atrMult)
+	if lfCfg.Enabled {
+		fmt.Printf("  London Fix: ON  window=%02d:%02d-%02d:%02d UTC  momentum×%.2f  fade×%.2f\n",
+			lfCfg.StartHour, lfCfg.StartMin, lfCfg.EndHour, lfCfg.EndMin, lfCfg.MomentumMult, lfCfg.FadeMult)
+	}
+	fmt.Println()
 	fmt.Printf("  %-3s  %-19s  %-19s  %-5s  %-7s  %-7s  %-7s\n",
 		"#", "OOS Start", "OOS End", "N", "WR%", "NetR", "Sharpe")
 	for i, w := range res.Windows {
@@ -1056,11 +1120,21 @@ func runPaperLive(args []string) int {
 	slippageNewsMult := fs.Float64("slippage-news-mult", 1.0, "multiplier applied to slippage in news windows")
 	bySession := fs.Bool("by-session", false, "use per-session weight table instead of the global one")
 	pollSeconds := fs.Int("poll-seconds", 0, "fixed poll cadence in seconds; 0 = align to interval boundary (recommended for free tier)")
+	londonFix := fs.Bool("london-fix", false, "apply the London Gold Fix session adjustment (Phase 3.1): momentum ×0.3 / fade ×1.5 inside the window")
+	londonFixStart := fs.String("london-fix-start", "14:40", "UTC start of the London Fix window (HH:MM)")
+	londonFixEnd := fs.String("london-fix-end", "15:20", "UTC end of the London Fix window (HH:MM)")
+	londonFixMomMult := fs.Float64("london-fix-momentum-mult", 0.3, "weight multiplier for momentum strategies inside the window (0 silences them)")
+	londonFixFadeMult := fs.Float64("london-fix-fade-mult", 1.5, "weight multiplier for liquidity-fade strategies inside the window (1.0 = neutral)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if *thresholdPct < 0 || *thresholdPct > 1 {
 		fmt.Fprintln(os.Stderr, "-threshold-percentile must be in [0, 1]")
+		return 2
+	}
+	lfCfg, err := buildLondonFixConfig(*londonFix, *londonFixStart, *londonFixEnd, *londonFixMomMult, *londonFixFadeMult)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
 	paperRunIDs, err := parsePaperRunIDs(*paperRun)
@@ -1130,6 +1204,7 @@ func runPaperLive(args []string) int {
 		PollSeconds:         *pollSeconds,
 		APIKey:              apiKey,
 		HTTPClient:          &http.Client{Timeout: 30 * time.Second},
+		LondonFix:           lfCfg,
 	}
 
 	fmt.Printf("═══ Paper Live — %s %s ═══\n", *symbol, *interval)
@@ -1141,6 +1216,10 @@ func runPaperLive(args []string) int {
 		id, *bySession, gate)
 	if len(paperRunIDs) > 0 {
 		fmt.Printf("  Feedback paper runs: %v\n", paperRunIDs)
+	}
+	if lfCfg.Enabled {
+		fmt.Printf("  London Fix: ON  window=%02d:%02d-%02d:%02d UTC  momentum×%.2f  fade×%.2f\n",
+			lfCfg.StartHour, lfCfg.StartMin, lfCfg.EndHour, lfCfg.EndMin, lfCfg.MomentumMult, lfCfg.FadeMult)
 	}
 	if *pollSeconds > 0 {
 		fmt.Printf("  Poll cadence: every %ds (fixed)\n", *pollSeconds)
