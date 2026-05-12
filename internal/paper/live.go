@@ -192,8 +192,21 @@ func RunLive(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig,
 					if err != nil {
 						log.Log("insert pending error: %v", err)
 					} else {
-						log.Log("ENTRY #%d  %s  %s  entry=%.2f  SL=%.2f  TP=%.2f  |  net=%+.2f  vote=%.2f  (%s)",
-							pendID, cs.Side.String(), p.Strategy, p.Entry, p.SL, p.TP,
+						// Strength prefix lets the CLI logger colorize by
+						// conviction: |net| ≥ 2.0 → STRONG (green), 1.0–2.0 →
+						// MED (cyan), <1.0 → WEAK (yellow). Thresholds derive
+						// from the production weight table (OBM 2.24,
+						// SilverBullet 2.13, FVGFill 1.65, DailyBreakout 0.14).
+						absNet := math.Abs(cs.NetWeight)
+						label := "ENTRY-WEAK"
+						switch {
+						case absNet >= 2.0:
+							label = "ENTRY"
+						case absNet >= 1.0:
+							label = "ENTRY-MED"
+						}
+						log.Log("%s #%d  %s  %s  entry=%.2f  SL=%.2f  TP=%.2f  |  net=%+.2f  vote=%.2f  (%s)",
+							label, pendID, cs.Side.String(), p.Strategy, p.Entry, p.SL, p.TP,
 							cs.NetWeight, cs.AppliedThreshold, cs.WinnerStrategy)
 					}
 				} else {

@@ -1121,7 +1121,9 @@ func runPaperReplay(args []string) int {
 // "BAR" event so the operator can tail it at a glance:
 //
 //   - BAR …            bold cyan, preceded by a blank line
-//   - ENTRY …          bold green (new pending position)
+//   - ENTRY …          bold green   — strong-conviction signal (|net| ≥ 2.0)
+//   - ENTRY-MED …      cyan         — mid-weight signal      (1.0 ≤ |net| < 2.0)
+//   - ENTRY-WEAK …     yellow       — marginal signal        (|net| < 1.0)
 //   - RESOLVED TP …    green
 //   - RESOLVED SL …    red
 //   - RESOLVED TIMESTOP/BE   magenta
@@ -1153,7 +1155,21 @@ func decorateLogLine(msg string) string {
 	switch {
 	case strings.HasPrefix(msg, "BAR  "):
 		return logBoldCyan + msg + logReset
+	case strings.HasPrefix(msg, "ENTRY-WEAK "):
+		// |net| < 1.0 — marginal cross of the percentile gate, often a
+		// lightweight strategy alone or near-cancellation of votes. Painted
+		// yellow so the operator immediately sees it's NOT a high-conviction
+		// setup despite being an "entry".
+		return logYellow + msg + logReset
+	case strings.HasPrefix(msg, "ENTRY-MED "):
+		// 1.0 ≤ |net| < 2.0 — one mid-weight strategy (e.g., FVGFill alone)
+		// produced the signal. Cyan distinguishes it from a heavyweight
+		// consensus or a multi-strategy agreement.
+		return logCyan + msg + logReset
 	case strings.HasPrefix(msg, "ENTRY "):
+		// |net| ≥ 2.0 — at least one heavyweight strategy fired
+		// (OrderBlockMit 2.24, SilverBullet 2.13) OR multiple strategies
+		// agreed on the same side. Bold green = high conviction.
 		return logBoldGreen + msg + logReset
 	case strings.HasPrefix(msg, "RESOLVED "):
 		switch {
@@ -1184,6 +1200,7 @@ var (
 	logGreen     = "\x1b[32m"
 	logYellow    = "\x1b[33m"
 	logMagenta   = "\x1b[35m"
+	logCyan      = "\x1b[36m"
 	logBoldCyan  = "\x1b[1;36m"
 	logBoldGreen = "\x1b[1;32m"
 )
@@ -1205,6 +1222,7 @@ func disableColorsIfNotTTY() {
 	logGreen = ""
 	logYellow = ""
 	logMagenta = ""
+	logCyan = ""
 	logBoldCyan = ""
 	logBoldGreen = ""
 }
