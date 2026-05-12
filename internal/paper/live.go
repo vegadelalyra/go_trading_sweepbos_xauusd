@@ -148,6 +148,13 @@ func RunLive(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig,
 		log.Log("warn: lastSignalled lookup failed: %v", err)
 	}
 
+	// Per-loop SMC cache. Seeded on the first iteration via Reset, then
+	// Append-extended bar-by-bar — collapses the 23s-per-poll cost of
+	// smc.Analyze on 165k candles into a 221µs per-bar update. wfa /
+	// paper-replay keep using batch Analyze; the analyzer is scoped to
+	// this loop and never escapes.
+	analyzer := smc.NewIncrementalAnalyzer()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -210,9 +217,18 @@ func RunLive(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig,
 			log.Log("BAR  %s UTC  close=$%.2f", latestClosed.Time.Format("2006-01-02 15:04"), latestClosed.Close)
 		}
 
+		// Sync the SMC cache with whatever loadAllCandles just returned.
+		// Slice up to latestIdx+1 so any open bar accidentally upserted
+		// from livefeed never reaches the analyzer (its OHLC mutates as
+		// the bar fills, which would corrupt append-only swing/FVG state).
+		// First poll seeds via Reset (≈16s on 165k bars); steady-state
+		// Appends the new tail in microseconds. Any time/length mismatch
+		// triggers a full rebuild rather than papering over corruption.
+		syncSMCAnalyzer(analyzer, candles[:latestIdx+1], log)
+
 		// ── Signal on the latest closed bar (if new) ───────────────────
 		if newBar {
-			a := smc.Analyze(candles)
+			a := analyzer.Analysis()
 			cs := compose(candles, a, latestIdx)
 			if cs.Recommended {
 				p, ok, reason := acceptSignal(candles, latestIdx, cs, params)
@@ -280,6 +296,49 @@ func RunLive(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig,
 		if stillOpen > 0 {
 			log.Log("pending=%d", stillOpen)
 		}
+	}
+}
+
+// syncSMCAnalyzer brings the per-loop IncrementalAnalyzer in line with the
+// candle slice that loadAllCandles just returned. Three paths:
+//
+//   - Empty analyzer → first iteration, Reset to seed from full history.
+//   - Tail match (analyzer.LastTime == candles[Len()-1].Time) → fast path,
+//     Append only the new bars at the end.
+//   - Anything else (shrunken DB, time drift, gap in the middle) → Reset
+//     and log the reason so the operator can see why the cache rebuilt.
+//
+// Reset paths emit a log line (operators can grep "smc cache" to spot
+// unexpected rebuilds); the Append fast path stays silent because it runs
+// on every poll and would dominate the log otherwise.
+func syncSMCAnalyzer(a *smc.IncrementalAnalyzer, candles []core.Candle, log Logger) {
+	n := a.Len()
+	if n == 0 {
+		t := time.Now()
+		a.Reset(candles)
+		log.Log("smc cache seeded: %d bars in %s", len(candles), time.Since(t).Round(time.Millisecond))
+		return
+	}
+	if n > len(candles) {
+		t := time.Now()
+		a.Reset(candles)
+		log.Log("smc cache rebuilt: db shrank (analyzer=%d, db=%d) in %s",
+			n, len(candles), time.Since(t).Round(time.Millisecond))
+		return
+	}
+	if !candles[n-1].Time.Equal(a.LastTime()) {
+		t := time.Now()
+		a.Reset(candles)
+		log.Log("smc cache rebuilt: time mismatch at index %d (analyzer=%s, db=%s) in %s",
+			n-1, a.LastTime().Format(time.RFC3339), candles[n-1].Time.Format(time.RFC3339),
+			time.Since(t).Round(time.Millisecond))
+		return
+	}
+	if len(candles) == n {
+		return // nothing new
+	}
+	for _, c := range candles[n:] {
+		a.Append(c)
 	}
 }
 
