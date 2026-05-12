@@ -38,52 +38,38 @@ func IsXAUUSDTradingDay(t time.Time) bool {
 	return true
 }
 
-// TradingDaysSince counts XAUUSD trading-DAY boundaries that have closed
-// between prev and now. A "boundary" is the daily NY 22:00 UTC roll.
+// TradingDaysSince counts XAUUSD trading days that have BEGUN strictly
+// after prev's UTC calendar date and at-or-before now's UTC calendar
+// date. A "trading day" is a UTC date that is Monday-Friday and not a
+// COMEX-observed US holiday.
+//
+// The semantic answers the operational question "have I touched a new
+// trading day since the last refresh?". Two restarts on the same UTC
+// date return 0; restarting after a UTC midnight rollover into a
+// weekday returns 1; restarting Monday morning after a Friday refresh
+// returns 1 (the weekend dates are skipped, Monday counts).
+//
 // Returns 0 if prev >= now.
-//
-// Examples (5m bars):
-//   - prev = Mon 18:00 UTC, now = Tue 03:00 UTC → 1 (Mon 22:00 roll crossed)
-//   - prev = Fri 18:00 UTC, now = Sat 12:00 UTC → 1 (Fri 22:00 roll crossed,
-//     even though Sat itself is not a trading day — we count session ENDS)
-//   - prev = Sat 12:00 UTC, now = Sun 23:00 UTC → 0 (no session close
-//     happened over the weekend; Sun 22:00 is a re-OPEN, not a close)
-//   - prev = Fri 18:00 UTC, now = Mon 23:00 UTC → 2 (Fri 22:00 + Mon 22:00)
-//
-// Holidays where COMEX is closed are NOT counted as trading-day boundaries,
-// even if the 22:00 UTC clock tick passes.
 func TradingDaysSince(prev, now time.Time) int {
 	if !now.After(prev) {
 		return 0
 	}
+	pYY, pMM, pDD := prev.UTC().Date()
+	nYY, nMM, nDD := now.UTC().Date()
+	prevDate := time.Date(pYY, pMM, pDD, 0, 0, 0, 0, time.UTC)
+	nowDate := time.Date(nYY, nMM, nDD, 0, 0, 0, 0, time.UTC)
 	count := 0
-	// Walk the daily 22:00 UTC roll cursor from the first roll after prev
-	// up to (and including) the last roll at-or-before now.
-	cursor := nextDailyRoll(prev.UTC())
-	end := now.UTC()
-	for !cursor.After(end) {
-		// A roll at cursor closes the day that just ended. The day that
-		// just ended runs from (cursor - 24h) to cursor. Skip if the day
-		// being closed was Sat/Sun UTC (XAUUSD shut Fri 21 UTC → Sun 22 UTC)
-		// or a US holiday observed by COMEX.
-		dayEnding := cursor.Add(-12 * time.Hour) // any time within the day-being-closed
-		wd := dayEnding.Weekday()
-		if wd != time.Saturday && wd != time.Sunday && !isUSHoliday(dayEnding) {
-			count++
+	for d := prevDate.AddDate(0, 0, 1); !d.After(nowDate); d = d.AddDate(0, 0, 1) {
+		wd := d.Weekday()
+		if wd == time.Saturday || wd == time.Sunday {
+			continue
 		}
-		cursor = cursor.Add(24 * time.Hour)
+		if isUSHoliday(d) {
+			continue
+		}
+		count++
 	}
 	return count
-}
-
-// nextDailyRoll returns the next 22:00 UTC instant strictly after t.
-func nextDailyRoll(t time.Time) time.Time {
-	u := t.UTC()
-	roll := time.Date(u.Year(), u.Month(), u.Day(), 22, 0, 0, 0, time.UTC)
-	if !roll.After(u) {
-		roll = roll.Add(24 * time.Hour)
-	}
-	return roll
 }
 
 // isUSHoliday returns true on COMEX-observed closures. Calls a per-year

@@ -82,19 +82,19 @@ func TestTradingDaysSince(t *testing.T) {
 		want      int
 		desc      string
 	}{
-		{"2026-05-11 18:00", "2026-05-12 03:00", 1, "Mon evening → Tue 03 UTC: Mon roll crossed"},
-		{"2026-05-11 18:00", "2026-05-11 23:00", 1, "Mon evening → Mon late: Mon 22 UTC roll crossed"},
-		{"2026-05-11 18:00", "2026-05-11 21:00", 0, "Mon evening → Mon 21 UTC: no roll yet"},
-		{"2026-05-08 18:00", "2026-05-09 12:00", 1, "Fri 18 → Sat noon: Fri 22 roll counts (session close)"},
-		{"2026-05-09 12:00", "2026-05-10 23:00", 0, "Sat noon → Sun 23: no session ends Sat or Sun"},
-		{"2026-05-08 18:00", "2026-05-11 23:00", 2, "Fri 18 → Mon 23: Fri close + Mon close"},
+		{"2026-05-11 18:00", "2026-05-12 03:00", 1, "Mon evening → Tue 03 UTC: crossed into Tue"},
+		{"2026-05-11 23:06", "2026-05-12 13:40", 1, "Mon late evening → Tue mid-day: crossed UTC midnight (the auto-refresh trigger case)"},
+		{"2026-05-11 18:00", "2026-05-11 23:00", 0, "Same UTC date (Mon → Mon): no new trading day"},
+		{"2026-05-12 09:00", "2026-05-12 14:00", 0, "Same UTC date (Tue → Tue): no new trading day"},
+		{"2026-05-08 18:00", "2026-05-09 12:00", 0, "Fri 18 → Sat noon: Sat is not a trading day"},
+		{"2026-05-09 12:00", "2026-05-10 23:00", 0, "Sat noon → Sun 23: weekend transitions don't count"},
+		{"2026-05-08 18:00", "2026-05-11 23:00", 1, "Fri 18 → Mon 23: weekend skipped, only Mon counts"},
 		{"2026-05-11 23:00", "2026-05-11 23:00", 0, "Same instant"},
 		{"2026-05-12 03:00", "2026-05-11 18:00", 0, "Reversed → 0"},
-		// Across a Monday holiday (MLK 2026-01-19): the Mon 22 UTC roll
-		// should be skipped because Mon is a holiday. Fri 18 → Tue 03
-		// crosses 4 daily rolls (Fri/Sat/Sun/Mon) but only Fri counts
-		// (Sat is weekend, Sun ditto, Mon is MLK).
-		{"2026-01-16 18:00", "2026-01-20 03:00", 1, "Fri → post-MLK Tue: only Fri close counts"},
+		// Across a Monday holiday (MLK 2026-01-19): Mon skipped, only
+		// Tue counts.
+		{"2026-01-16 18:00", "2026-01-20 03:00", 1, "Fri → post-MLK Tue: only Tue counts"},
+		{"2026-01-16 18:00", "2026-01-21 03:00", 2, "Fri → post-MLK Wed: Tue + Wed"},
 	}
 	for _, c := range cases {
 		got := TradingDaysSince(tUTC(c.prev), tUTC(c.now))

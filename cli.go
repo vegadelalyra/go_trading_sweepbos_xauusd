@@ -1407,7 +1407,7 @@ func runPaperLive(args []string) int {
 	fmt.Println("  Press Ctrl+C to stop and finalize the run.")
 	fmt.Println()
 
-	paperRunID, err := paper.RunLive(ctx, pool, cfg, flat, bySessTbl, stdoutLogger{})
+	paperRunID, err := paper.RunLive(ctx, pool, cfg, flat, bySessTbl, paperRunIDs, stdoutLogger{})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "live: %v\n", err)
 		return 1

@@ -15,6 +15,7 @@ import (
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/core"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/engine"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/livefeed"
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/marketcal"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/meta"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/smc"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy"
@@ -80,7 +81,7 @@ type Logger interface {
 // signal, and grade, then sleep until the next interval boundary.
 func RunLive(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig,
 	weights map[string]float64, weightsBySession map[string]map[string]float64,
-	log Logger) (int64, error) {
+	paperRunIDs []int64, log Logger) (int64, error) {
 
 	params := buildLiveParams(cfg)
 
@@ -89,12 +90,32 @@ func RunLive(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig,
 		return 0, fmt.Errorf("unsupported interval %q", cfg.Interval)
 	}
 
-	// Compose function is closed over the weight table chosen at startup.
-	// Re-evaluating weights every poll is overkill — the underlying
-	// LoadWeights call hits Postgres; we'd just be re-deriving the same
-	// numbers. Built early so replayMissedSignals can reuse it and warm
-	// the dynamic-threshold buffer with historical NetWeights.
-	compose := buildComposer(cfg, weights, weightsBySession)
+	// Atomic-pointer store so the background auto-refresh goroutine can
+	// hot-swap weights without coordinating with the signal loop. compose()
+	// loads the current bundle once at the top of each poll, so a swap
+	// can never split a single signal computation.
+	store := newWeightStore(weights, weightsBySession, cfg.SourceRunID)
+	compose := buildComposer(cfg, store)
+
+	// Spawn the auto-refresh goroutine if at least one XAUUSD trading day
+	// has passed since the most recent canonical row AND today is itself
+	// a trading instant. Logs the decision either way so the operator can
+	// see why nothing fired on a weekend / holiday.
+	startupForRefresh := time.Now().UTC()
+	if fire, lastRefresh, err := shouldAutoRefresh(ctx, pool, cfg, startupForRefresh); err != nil {
+		log.Log("auto-refresh: decision query failed: %v — skipping", err)
+	} else if !fire {
+		if lastRefresh.IsZero() {
+			log.Log("auto-refresh: skipped (no canonical row yet, but today is not a trading instant)")
+		} else {
+			days := marketcal.TradingDaysSince(lastRefresh, startupForRefresh)
+			log.Log("auto-refresh: skipped (last canonical %s ago = %d trading days, today_is_trading=%t)",
+				startupForRefresh.Sub(lastRefresh).Round(time.Minute), days,
+				marketcal.IsXAUUSDTradingDay(startupForRefresh))
+		}
+	} else {
+		go runAutoRefresh(ctx, pool, cfg, cfg.SourceRunID, store, paperRunIDs, RefreshDeps{}, log)
+	}
 
 	// Replay any ENTRY-tier signals (|net|≥2.0) that closed since the last
 	// graceful shutdown, capped at 24h. Runs BEFORE createLiveRun so the
@@ -277,11 +298,17 @@ func buildLiveParams(cfg LiveConfig) engine.BacktestParams {
 	return p
 }
 
-func buildComposer(cfg LiveConfig, weights map[string]float64, weightsBySession map[string]map[string]float64) func([]core.Candle, smc.Analysis, int) meta.CompositeSignal {
+func buildComposer(cfg LiveConfig, store *weightStore) func([]core.Candle, smc.Analysis, int) meta.CompositeSignal {
 	// Dynamic-percentile mode: keep a buffer alive across iterations so the
 	// rolling |NetWeight| distribution carries over poll-to-poll. The
 	// closure capture is the only reason a sessions-long buffer survives —
 	// callers must not reuse a closure across runs.
+	//
+	// IMPORTANT: the buffer survives across weight hot-swaps too. The
+	// distribution of |NetWeight| changes shape AFTER a swap, but the
+	// rolling window will naturally re-converge over ~DefaultThresholdBufferCap
+	// bars. Resetting would create a cold gate for ~2000 bars after every
+	// refresh — much worse than the transient distribution shift.
 	var buf *meta.ThresholdBuffer
 	if cfg.ThresholdPercentile > 0 {
 		buf = meta.NewThresholdBuffer(meta.DefaultThresholdBufferCap)
@@ -293,19 +320,23 @@ func buildComposer(cfg LiveConfig, weights map[string]float64, weightsBySession 
 	switch {
 	case cfg.BySession && buf != nil:
 		return func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
-			return meta.ComposeSignalBySessionDynamic(c, a, i, weightsBySession, cfg.ThresholdPercentile, buf, cfg.LondonFix, cfg.COMEXPin, dxy)
+			b := store.load()
+			return meta.ComposeSignalBySessionDynamic(c, a, i, b.bySess, cfg.ThresholdPercentile, buf, cfg.LondonFix, cfg.COMEXPin, dxy)
 		}
 	case cfg.BySession:
 		return func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
-			return meta.ComposeSignalBySession(c, a, i, weightsBySession, cfg.Threshold, cfg.LondonFix, cfg.COMEXPin, dxy)
+			b := store.load()
+			return meta.ComposeSignalBySession(c, a, i, b.bySess, cfg.Threshold, cfg.LondonFix, cfg.COMEXPin, dxy)
 		}
 	case buf != nil:
 		return func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
-			return meta.ComposeSignalDynamic(c, a, i, weights, cfg.ThresholdPercentile, buf, cfg.LondonFix, cfg.COMEXPin, dxy)
+			b := store.load()
+			return meta.ComposeSignalDynamic(c, a, i, b.flat, cfg.ThresholdPercentile, buf, cfg.LondonFix, cfg.COMEXPin, dxy)
 		}
 	default:
 		return func(c []core.Candle, a smc.Analysis, i int) meta.CompositeSignal {
-			return meta.ComposeSignal(c, a, i, weights, cfg.Threshold, cfg.LondonFix, cfg.COMEXPin, dxy)
+			b := store.load()
+			return meta.ComposeSignal(c, a, i, b.flat, cfg.Threshold, cfg.LondonFix, cfg.COMEXPin, dxy)
 		}
 	}
 }
