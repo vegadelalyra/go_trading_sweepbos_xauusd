@@ -114,7 +114,7 @@ func RunLive(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig,
 		// the just-closed candle. PollSeconds>0 → fixed cadence (useful
 		// for paid-tier users who want lower latency).
 		wait := nextPollDelay(time.Now(), intervalDur, cfg.PollSeconds)
-		log.Log("sleeping %s until next poll", wait.Round(time.Second))
+		log.Log("sleep %s", wait.Round(time.Second))
 		select {
 		case <-ctx.Done():
 			return paperRunID, finalizeLiveRun(context.Background(), pool, paperRunID, time.Now().UTC(), log)
@@ -161,7 +161,7 @@ func RunLive(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig,
 
 		newBar := latestClosed.Time.After(lastSignalled)
 		if newBar {
-			log.Log("new closed bar %s  close=$%.2f", latestClosed.Time.Format("2006-01-02 15:04"), latestClosed.Close)
+			log.Log("BAR  %s UTC  close=$%.2f", latestClosed.Time.Format("2006-01-02 15:04"), latestClosed.Close)
 		}
 
 		// ── Signal on the latest closed bar (if new) ───────────────────
@@ -175,16 +175,18 @@ func RunLive(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig,
 					if err != nil {
 						log.Log("insert pending error: %v", err)
 					} else {
-						log.Log("✓ pending #%d  %s %-5s entry=%.2f SL=%.2f TP=%.2f net=%+.2f conf=%.0f%% (winner: %s)",
+						log.Log("ENTRY #%d  %s  %s  entry=%.2f  SL=%.2f  TP=%.2f  |  net=%+.2f  vote=%.2f  (%s)",
 							pendID, cs.Side.String(), p.Strategy, p.Entry, p.SL, p.TP,
-							cs.NetWeight, cs.Confidence*100, cs.WinnerStrategy)
+							cs.NetWeight, cs.AppliedThreshold, cs.WinnerStrategy)
 					}
 				} else {
-					log.Log("composite %s rejected (winner: %s) — %s", cs.Side.String(), cs.WinnerStrategy, reason)
+					log.Log("REJECT %s by %s — %s  |  net=%+.2f  vote=%.2f",
+						cs.Side.String(), cs.WinnerStrategy, reason, cs.NetWeight, cs.AppliedThreshold)
 				}
 			} else {
-				log.Log("no recommendation (long=%.2f short=%.2f net=%+.2f)",
-					cs.LongWeight, cs.ShortWeight, cs.NetWeight)
+				deficit := cs.AppliedThreshold - math.Abs(cs.NetWeight)
+				log.Log("NO TRADE  long=%.2f  short=%.2f  net=%+.2f  vote=%.2f  deficit=%.2f",
+					cs.LongWeight, cs.ShortWeight, cs.NetWeight, cs.AppliedThreshold, deficit)
 			}
 			lastSignalled = latestClosed.Time
 		}
@@ -208,14 +210,14 @@ func RunLive(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig,
 			if !tr.Win {
 				result = "SL"
 			}
-			if tr.ExitIdx-tr.EntryIdx >= params.MaxHoldCandles {
-				result = "time-stop"
+			if params.MaxHoldCandles > 0 && tr.ExitIdx-tr.EntryIdx >= params.MaxHoldCandles {
+				result = "TIMESTOP"
 			}
-			log.Log("→ pending #%d resolved %s at %s  exit=$%.2f  R=%+.2f  (%s, %d candles)",
-				pos.ID, result, tr.ExitTime.Format("15:04"), tr.ExitPrice, tr.R, pos.Strategy, tr.ExitIdx-tr.EntryIdx)
+			log.Log("RESOLVED #%d  %s  exit=$%.2f  R=%+.2f  held=%dc  (%s)",
+				pos.ID, result, tr.ExitPrice, tr.R, tr.ExitIdx-tr.EntryIdx, pos.Strategy)
 		}
 		if open := len(pending); open > 0 {
-			log.Log("status: %d pending still open", open)
+			log.Log("pending=%d", open)
 		}
 	}
 }

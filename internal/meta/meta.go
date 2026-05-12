@@ -283,10 +283,16 @@ type CompositeSignal struct {
 	NetWeight   float64   // LongWeight − ShortWeight
 	Confidence  float64   // |NetWeight| / (LongWeight + ShortWeight); 0..1
 	Recommended bool      // true if |NetWeight| crosses threshold
-	Triggers    []TaggedSignal
-	BestEntry   float64
-	BestSL      float64
-	BestTP      float64
+	// AppliedThreshold is the gate the composer compared |NetWeight|
+	// against. For ComposeSignal it's the caller's static threshold; for
+	// ComposeSignalDynamic it's the percentile-derived value at this bar.
+	// Logged so a downstream operator sees both "how strong was the vote"
+	// AND "how close was it to firing".
+	AppliedThreshold float64
+	Triggers         []TaggedSignal
+	BestEntry        float64
+	BestSL           float64
+	BestTP           float64
 	// WinnerStrategy names the strategy whose Entry/SL/TP were chosen — i.e.
 	// the highest-weighted contributor on the winning side. Empty when
 	// Recommended is false. Critical for attribution: composite trades that
@@ -352,6 +358,7 @@ func composeCore(candles []core.Candle, a smc.Analysis, i int, weightOf func(str
 // CompositeSignal struct returned from composeCore is the one the caller
 // receives.
 func applyThreshold(cs *CompositeSignal, bestLong, bestShort *TaggedSignal, threshold float64) {
+	cs.AppliedThreshold = threshold
 	if cs.NetWeight >= threshold && bestLong != nil {
 		cs.Side = core.Long
 		cs.Recommended = true

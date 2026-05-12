@@ -33,6 +33,7 @@ import (
 // run is the CLI dispatcher invoked from main().
 func run(args []string) int {
 	_ = godotenv.Load()
+	disableColorsIfNotTTY()
 
 	if len(args) < 2 {
 		return runTUI()
@@ -947,10 +948,97 @@ func runPaperReplay(args []string) int {
 // (sleep, fetch, signal, grade) so users can tail the script and see the
 // system reasoning in real time. Errors are NOT printed via Log — they
 // stay on stderr.
+//
+// Output is enriched with ANSI colors and an extra blank line before each
+// "BAR" event so the operator can tail it at a glance:
+//
+//   - BAR …            bold cyan, preceded by a blank line
+//   - ENTRY …          bold green (new pending position)
+//   - RESOLVED TP …    green
+//   - RESOLVED SL …    red
+//   - RESOLVED TIMESTOP/BE   magenta
+//   - REJECT …         yellow (filter killed the composite vote)
+//   - NO TRADE …       dim (vote did not cross threshold)
+//   - sleep / poll …   dim
+//
+// Colors are disabled automatically when stdout is not a TTY (file pipe,
+// CI capture) so log files stay greppable.
 type stdoutLogger struct{}
 
 func (stdoutLogger) Log(format string, args ...any) {
-	fmt.Printf("[%s] %s\n", time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
+	msg := fmt.Sprintf(format, args...)
+	line := decorateLogLine(msg)
+	if isBarStart(msg) {
+		fmt.Println() // visual separator before each new bar block
+	}
+	fmt.Printf("%s[%s]%s %s\n", logDim, time.Now().Format("15:04:05"), logReset, line)
+}
+
+// isBarStart reports whether the message is the heading of a new bar
+// poll cycle — printed in a more prominent style and preceded by a blank
+// line to break the wall of text into per-bar blocks.
+func isBarStart(msg string) bool { return strings.HasPrefix(msg, "BAR  ") }
+
+// decorateLogLine prefixes the message with the ANSI sequence matching its
+// semantic class. Unknown messages pass through uncoloured.
+func decorateLogLine(msg string) string {
+	switch {
+	case strings.HasPrefix(msg, "BAR  "):
+		return logBoldCyan + msg + logReset
+	case strings.HasPrefix(msg, "ENTRY "):
+		return logBoldGreen + msg + logReset
+	case strings.HasPrefix(msg, "RESOLVED "):
+		switch {
+		case strings.HasPrefix(msg, "RESOLVED #") && strings.Contains(msg, " TP "):
+			return logGreen + msg + logReset
+		case strings.HasPrefix(msg, "RESOLVED #") && strings.Contains(msg, " SL "):
+			return logRed + msg + logReset
+		default:
+			return logMagenta + msg + logReset
+		}
+	case strings.HasPrefix(msg, "REJECT "):
+		return logYellow + msg + logReset
+	case strings.HasPrefix(msg, "NO TRADE"):
+		return logDim + msg + logReset
+	case strings.HasPrefix(msg, "sleep ") || strings.HasPrefix(msg, "pending=") || strings.HasPrefix(msg, "paper_runs.id="):
+		return logDim + msg + logReset
+	default:
+		return msg
+	}
+}
+
+// ANSI escape codes; set to empty strings at startup when stdout is not a
+// TTY so redirected logs (files, pipes) stay clean.
+var (
+	logReset     = "\x1b[0m"
+	logDim       = "\x1b[2m"
+	logRed       = "\x1b[31m"
+	logGreen     = "\x1b[32m"
+	logYellow    = "\x1b[33m"
+	logMagenta   = "\x1b[35m"
+	logBoldCyan  = "\x1b[1;36m"
+	logBoldGreen = "\x1b[1;32m"
+)
+
+// disableColorsIfNotTTY blanks the ANSI variables when stdout is not a
+// character device (i.e., the output was redirected). Called once at
+// CLI startup from main().
+func disableColorsIfNotTTY() {
+	fi, err := os.Stdout.Stat()
+	if err != nil {
+		return
+	}
+	if fi.Mode()&os.ModeCharDevice != 0 {
+		return // real terminal — keep colors
+	}
+	logReset = ""
+	logDim = ""
+	logRed = ""
+	logGreen = ""
+	logYellow = ""
+	logMagenta = ""
+	logBoldCyan = ""
+	logBoldGreen = ""
 }
 
 func runPaperLive(args []string) int {
