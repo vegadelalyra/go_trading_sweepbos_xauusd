@@ -433,6 +433,31 @@ func buildLondonFixConfig(enabled bool, start, end string, momMult, fadeMult flo
 	}, nil
 }
 
+// buildCOMEXPinConfig assembles a meta.COMEXPinConfig from the
+// per-subcommand CLI flags. When `enabled` is false the helper returns a
+// zero-value Enabled=false config — a strict no-op downstream regardless
+// of the other parameters. When `enabled` is true the caller is
+// responsible for populating ExpiryDates via meta.LoadExpiryDates before
+// constructing the composer; this helper only validates the multipliers
+// so a typo surfaces immediately.
+func buildCOMEXPinConfig(enabled bool, preHours int, momMult, fadeMult float64) (meta.COMEXPinConfig, error) {
+	if preHours <= 0 {
+		return meta.COMEXPinConfig{}, fmt.Errorf("-comex-pre-hours must be > 0")
+	}
+	if momMult < 0 {
+		return meta.COMEXPinConfig{}, fmt.Errorf("-comex-momentum-mult must be >= 0")
+	}
+	if fadeMult < 0 {
+		return meta.COMEXPinConfig{}, fmt.Errorf("-comex-fade-mult must be >= 0")
+	}
+	return meta.COMEXPinConfig{
+		Enabled:        enabled,
+		PreWindowHours: preHours,
+		MomentumMult:   momMult,
+		FadeMult:       fadeMult,
+	}, nil
+}
+
 func runWeights(args []string) int {
 	fs := flag.NewFlagSet("weights", flag.ContinueOnError)
 	runID := fs.Int64("run-id", 0, "backtest_runs.id to source weights from (0 = latest)")
@@ -541,11 +566,11 @@ func runSignal(args []string) int {
 		}
 		if buf != nil {
 			compose = func(i int) meta.CompositeSignal {
-				return meta.ComposeSignalBySessionDynamic(candles, a, i, ws, *thresholdPct, buf, meta.LondonFixConfig{})
+				return meta.ComposeSignalBySessionDynamic(candles, a, i, ws, *thresholdPct, buf, meta.LondonFixConfig{}, meta.COMEXPinConfig{})
 			}
 		} else {
 			compose = func(i int) meta.CompositeSignal {
-				return meta.ComposeSignalBySession(candles, a, i, ws, *threshold, meta.LondonFixConfig{})
+				return meta.ComposeSignalBySession(candles, a, i, ws, *threshold, meta.LondonFixConfig{}, meta.COMEXPinConfig{})
 			}
 		}
 	} else {
@@ -557,11 +582,11 @@ func runSignal(args []string) int {
 		weights := meta.WeightMap(ws)
 		if buf != nil {
 			compose = func(i int) meta.CompositeSignal {
-				return meta.ComposeSignalDynamic(candles, a, i, weights, *thresholdPct, buf, meta.LondonFixConfig{})
+				return meta.ComposeSignalDynamic(candles, a, i, weights, *thresholdPct, buf, meta.LondonFixConfig{}, meta.COMEXPinConfig{})
 			}
 		} else {
 			compose = func(i int) meta.CompositeSignal {
-				return meta.ComposeSignal(candles, a, i, weights, *threshold, meta.LondonFixConfig{})
+				return meta.ComposeSignal(candles, a, i, weights, *threshold, meta.LondonFixConfig{}, meta.COMEXPinConfig{})
 			}
 		}
 	}
@@ -642,6 +667,10 @@ func runWFA(args []string) int {
 	londonFixEnd := fs.String("london-fix-end", "15:20", "UTC end of the London Fix window (HH:MM)")
 	londonFixMomMult := fs.Float64("london-fix-momentum-mult", 0.3, "weight multiplier for momentum strategies inside the window (0 silences them)")
 	londonFixFadeMult := fs.Float64("london-fix-fade-mult", 1.5, "weight multiplier for liquidity-fade strategies inside the window (1.0 = neutral)")
+	comexPin := fs.Bool("comex-pinning", false, "apply the COMEX expiry pinning filter (Phase 3.2): momentum ×0.0 / mean-reversion ×1.3 inside the 48h pre-expiry window")
+	comexPreHours := fs.Int("comex-pre-hours", 48, "hours BEFORE each seeded GC expiry that the pinning regime kicks in")
+	comexMomMult := fs.Float64("comex-momentum-mult", 0.0, "weight multiplier for momentum strategies inside the COMEX pre-expiry window (0 silences them)")
+	comexFadeMult := fs.Float64("comex-fade-mult", 1.3, "weight multiplier for mean-reversion strategies inside the COMEX pre-expiry window (1.0 = neutral)")
 	persist := fs.Bool("persist", false, "store this WFA run + every OOS trade in wfa_runs/wfa_trades")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -655,6 +684,11 @@ func runWFA(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
+	comexCfg, err := buildCOMEXPinConfig(*comexPin, *comexPreHours, *comexMomMult, *comexFadeMult)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
 
 	ctx := context.Background()
 	pool, err := openPool(ctx)
@@ -663,6 +697,23 @@ func runWFA(args []string) int {
 		return 1
 	}
 	defer pool.Close()
+
+	// Populate the expiry-date list from the comex_expiry table only when
+	// the overlay is actually enabled. A miswire (table missing, empty,
+	// permissions) surfaces immediately rather than silently degrading to
+	// "Enabled=true but no dates" which would behave as a no-op.
+	if comexCfg.Enabled {
+		dates, err := meta.LoadExpiryDates(ctx, pool)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load comex_expiry: %v\n", err)
+			return 1
+		}
+		if len(dates) == 0 {
+			fmt.Fprintln(os.Stderr, "comex_expiry is empty — apply schema/005_comex_expiry.sql first")
+			return 1
+		}
+		comexCfg.ExpiryDates = dates
+	}
 
 	cfg := wfa.WFAConfig{
 		Symbol: *symbol, Interval: *interval,
@@ -683,6 +734,7 @@ func runWFA(args []string) int {
 		},
 		BayesShrink: *bayesShrink,
 		LondonFix:   lfCfg,
+		COMEXPin:    comexCfg,
 	}
 	candles, err := loadCandles(ctx, pool, cfg.Symbol, cfg.Interval, cfg.StartDate, cfg.EndDate)
 	if err != nil {
@@ -713,6 +765,10 @@ func runWFA(args []string) int {
 	if lfCfg.Enabled {
 		fmt.Printf("  London Fix: ON  window=%02d:%02d-%02d:%02d UTC  momentum×%.2f  fade×%.2f\n",
 			lfCfg.StartHour, lfCfg.StartMin, lfCfg.EndHour, lfCfg.EndMin, lfCfg.MomentumMult, lfCfg.FadeMult)
+	}
+	if comexCfg.Enabled {
+		fmt.Printf("  COMEX Pinning: ON  pre=%dh  momentum×%.2f  fade×%.2f  expiries=%d\n",
+			comexCfg.PreWindowHours, comexCfg.MomentumMult, comexCfg.FadeMult, len(comexCfg.ExpiryDates))
 	}
 	fmt.Println()
 	fmt.Printf("  %-3s  %-19s  %-19s  %-5s  %-7s  %-7s  %-7s\n",
@@ -1125,6 +1181,10 @@ func runPaperLive(args []string) int {
 	londonFixEnd := fs.String("london-fix-end", "15:20", "UTC end of the London Fix window (HH:MM)")
 	londonFixMomMult := fs.Float64("london-fix-momentum-mult", 0.3, "weight multiplier for momentum strategies inside the window (0 silences them)")
 	londonFixFadeMult := fs.Float64("london-fix-fade-mult", 1.5, "weight multiplier for liquidity-fade strategies inside the window (1.0 = neutral)")
+	comexPin := fs.Bool("comex-pinning", false, "apply the COMEX expiry pinning filter (Phase 3.2): momentum ×0.0 / mean-reversion ×1.3 inside the 48h pre-expiry window")
+	comexPreHours := fs.Int("comex-pre-hours", 48, "hours BEFORE each seeded GC expiry that the pinning regime kicks in")
+	comexMomMult := fs.Float64("comex-momentum-mult", 0.0, "weight multiplier for momentum strategies inside the COMEX pre-expiry window (0 silences them)")
+	comexFadeMult := fs.Float64("comex-fade-mult", 1.3, "weight multiplier for mean-reversion strategies inside the COMEX pre-expiry window (1.0 = neutral)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -1133,6 +1193,11 @@ func runPaperLive(args []string) int {
 		return 2
 	}
 	lfCfg, err := buildLondonFixConfig(*londonFix, *londonFixStart, *londonFixEnd, *londonFixMomMult, *londonFixFadeMult)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	comexCfg, err := buildCOMEXPinConfig(*comexPin, *comexPreHours, *comexMomMult, *comexFadeMult)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
@@ -1193,6 +1258,22 @@ func runPaperLive(args []string) int {
 		flat = meta.WeightMap(ws)
 	}
 
+	// Populate COMEX expiry dates from comex_expiry only when the overlay
+	// is actually enabled. Mirrors the wfa subcommand wiring; a miswired
+	// table surfaces immediately rather than degrading into a silent no-op.
+	if comexCfg.Enabled {
+		dates, err := meta.LoadExpiryDates(ctx, pool)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load comex_expiry: %v\n", err)
+			return 1
+		}
+		if len(dates) == 0 {
+			fmt.Fprintln(os.Stderr, "comex_expiry is empty — apply schema/005_comex_expiry.sql first")
+			return 1
+		}
+		comexCfg.ExpiryDates = dates
+	}
+
 	cfg := paper.LiveConfig{
 		SourceRunID: id, BySession: *bySession,
 		Symbol: *symbol, Interval: *interval,
@@ -1205,6 +1286,7 @@ func runPaperLive(args []string) int {
 		APIKey:              apiKey,
 		HTTPClient:          &http.Client{Timeout: 30 * time.Second},
 		LondonFix:           lfCfg,
+		COMEXPin:            comexCfg,
 	}
 
 	fmt.Printf("═══ Paper Live — %s %s ═══\n", *symbol, *interval)
@@ -1220,6 +1302,10 @@ func runPaperLive(args []string) int {
 	if lfCfg.Enabled {
 		fmt.Printf("  London Fix: ON  window=%02d:%02d-%02d:%02d UTC  momentum×%.2f  fade×%.2f\n",
 			lfCfg.StartHour, lfCfg.StartMin, lfCfg.EndHour, lfCfg.EndMin, lfCfg.MomentumMult, lfCfg.FadeMult)
+	}
+	if comexCfg.Enabled {
+		fmt.Printf("  COMEX Pinning: ON  pre=%dh  momentum×%.2f  fade×%.2f  expiries=%d\n",
+			comexCfg.PreWindowHours, comexCfg.MomentumMult, comexCfg.FadeMult, len(comexCfg.ExpiryDates))
 	}
 	if *pollSeconds > 0 {
 		fmt.Printf("  Poll cadence: every %ds (fixed)\n", *pollSeconds)

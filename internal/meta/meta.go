@@ -321,9 +321,15 @@ type TaggedSignal struct {
 // (Enabled=false) is a no-op — every existing caller path stays bit-for-bit
 // identical until London Fix is explicitly enabled.
 //
+// The COMEXPinConfig argument is the Phase 3.2 sibling overlay: it silences
+// momentum/breakout strategies and boosts mean-reversion ones inside the
+// 48h pre-expiry window around the seeded GC option expiry dates. Same
+// "zero-value is a no-op" contract as LondonFixConfig — both adjusters are
+// composable; lf runs first, then comex on the lf-adjusted weight.
+//
 // Returns the in-progress CompositeSignal plus the best-weighted long and
 // short triggers (for applyThreshold to promote into the recommended levels).
-func composeCore(candles []core.Candle, a smc.Analysis, i int, weightOf func(strat, sess string) float64, lf LondonFixConfig) (CompositeSignal, *TaggedSignal, *TaggedSignal) {
+func composeCore(candles []core.Candle, a smc.Analysis, i int, weightOf func(strat, sess string) float64, lf LondonFixConfig, comex COMEXPinConfig) (CompositeSignal, *TaggedSignal, *TaggedSignal) {
 	cs := CompositeSignal{}
 	var bestLong, bestShort *TaggedSignal
 	sess := core.ClassifySession(candles[i].Time)
@@ -338,6 +344,12 @@ func composeCore(candles []core.Candle, a smc.Analysis, i int, weightOf func(str
 		// so a zero base weight stays zero and a non-zero one is scaled
 		// only inside the 14:40-15:20 UTC window (see LondonFixConfig).
 		w = lf.adjust(w, sig.Strategy, candleTime)
+		// COMEX pinning adjustment composes on top of the lf-adjusted
+		// weight. Order matters only if both overlays touch the SAME
+		// strategy, which the current classifiers (IsLondonFixMomentum,
+		// IsLiquidityFade, IsMeanReversion) deliberately keep disjoint —
+		// so the two overlays are commutative in practice.
+		w = comex.adjust(w, sig.Strategy, candleTime)
 		if w <= 0 {
 			continue
 		}
@@ -392,12 +404,14 @@ func applyThreshold(cs *CompositeSignal, bestLong, bestShort *TaggedSignal, thre
 // individual entry/SL/TP triplet from the winning side as the recommended
 // execution levels.
 //
-// The trailing LondonFixConfig (zero-value = no-op) lets callers enable the
-// 15:00 GMT fix-window weight adjustment without touching the return shape.
-func ComposeSignal(candles []core.Candle, a smc.Analysis, i int, weights map[string]float64, threshold float64, lf LondonFixConfig) CompositeSignal {
+// The trailing LondonFixConfig and COMEXPinConfig (zero-values = no-op)
+// let callers enable the 15:00 GMT fix-window adjustment and the 48h
+// COMEX pre-expiry pinning adjustment respectively, without touching the
+// return shape.
+func ComposeSignal(candles []core.Candle, a smc.Analysis, i int, weights map[string]float64, threshold float64, lf LondonFixConfig, comex COMEXPinConfig) CompositeSignal {
 	cs, bL, bS := composeCore(candles, a, i, func(strat, _ string) float64 {
 		return weights[strat]
-	}, lf)
+	}, lf, comex)
 	applyThreshold(&cs, bL, bS, threshold)
 	return cs
 }
@@ -408,14 +422,15 @@ func ComposeSignal(candles []core.Candle, a smc.Analysis, i int, weights map[str
 // while staying silent in NY-AM, and vice versa.
 //
 // Same threshold and best-entry tie-break as ComposeSignal; only the weight
-// lookup differs. The trailing LondonFixConfig is identical in semantics.
-func ComposeSignalBySession(candles []core.Candle, a smc.Analysis, i int, weightsBySession map[string]map[string]float64, threshold float64, lf LondonFixConfig) CompositeSignal {
+// lookup differs. The trailing LondonFixConfig and COMEXPinConfig are
+// identical in semantics.
+func ComposeSignalBySession(candles []core.Candle, a smc.Analysis, i int, weightsBySession map[string]map[string]float64, threshold float64, lf LondonFixConfig, comex COMEXPinConfig) CompositeSignal {
 	cs, bL, bS := composeCore(candles, a, i, func(strat, sess string) float64 {
 		if perSess, ok := weightsBySession[strat]; ok {
 			return perSess[sess]
 		}
 		return 0
-	}, lf)
+	}, lf, comex)
 	applyThreshold(&cs, bL, bS, threshold)
 	return cs
 }
@@ -434,12 +449,13 @@ func ComposeSignalBySession(candles []core.Candle, a smc.Analysis, i int, weight
 // should warm the buffer (e.g., on the IS slice of a WFA window) before
 // gating any decision.
 //
-// The trailing LondonFixConfig (zero-value = no-op) lets callers enable the
-// 15:00 GMT fix-window weight adjustment.
-func ComposeSignalDynamic(candles []core.Candle, a smc.Analysis, i int, weights map[string]float64, percentile float64, buf *ThresholdBuffer, lf LondonFixConfig) CompositeSignal {
+// The trailing LondonFixConfig and COMEXPinConfig (zero-values = no-op)
+// let callers enable the 15:00 GMT fix-window adjustment and the 48h
+// COMEX pre-expiry pinning adjustment respectively.
+func ComposeSignalDynamic(candles []core.Candle, a smc.Analysis, i int, weights map[string]float64, percentile float64, buf *ThresholdBuffer, lf LondonFixConfig, comex COMEXPinConfig) CompositeSignal {
 	cs, bL, bS := composeCore(candles, a, i, func(strat, _ string) float64 {
 		return weights[strat]
-	}, lf)
+	}, lf, comex)
 	if buf != nil && (cs.LongWeight+cs.ShortWeight) > 0 {
 		buf.Push(math.Abs(cs.NetWeight))
 	}
@@ -454,13 +470,13 @@ func ComposeSignalDynamic(candles []core.Candle, a smc.Analysis, i int, weights 
 // ComposeSignalBySessionDynamic is the per-session-aware companion to
 // ComposeSignalDynamic — same percentile-gate behavior, per-session weight
 // lookup. See ComposeSignalBySession for the rationale of per-session weights.
-func ComposeSignalBySessionDynamic(candles []core.Candle, a smc.Analysis, i int, weightsBySession map[string]map[string]float64, percentile float64, buf *ThresholdBuffer, lf LondonFixConfig) CompositeSignal {
+func ComposeSignalBySessionDynamic(candles []core.Candle, a smc.Analysis, i int, weightsBySession map[string]map[string]float64, percentile float64, buf *ThresholdBuffer, lf LondonFixConfig, comex COMEXPinConfig) CompositeSignal {
 	cs, bL, bS := composeCore(candles, a, i, func(strat, sess string) float64 {
 		if perSess, ok := weightsBySession[strat]; ok {
 			return perSess[sess]
 		}
 		return 0
-	}, lf)
+	}, lf, comex)
 	if buf != nil && (cs.LongWeight+cs.ShortWeight) > 0 {
 		buf.Push(math.Abs(cs.NetWeight))
 	}

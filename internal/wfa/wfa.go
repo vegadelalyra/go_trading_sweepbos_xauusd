@@ -76,6 +76,11 @@ type WFAConfig struct {
 	// a strict no-op — the legacy ComposeSignal path is preserved bit-for-bit.
 	// See meta.LondonFixConfig for the microstructural rationale.
 	LondonFix meta.LondonFixConfig
+	// COMEXPin toggles the 48h pre-expiry pinning adjustment (Phase 3.2)
+	// at vote time inside each OOS window. Zero-value (Enabled=false) is
+	// a strict no-op — preserves the legacy ComposeSignal path bit-for-bit.
+	// See meta.COMEXPinConfig for the microstructural rationale.
+	COMEXPin meta.COMEXPinConfig
 }
 
 // WFAWindow holds one IS→OOS slice plus the OOS-side performance.
@@ -178,9 +183,9 @@ func RunWFA(cfg WFAConfig, candles []core.Candle, h4Candles []core.Candle) (WFAR
 		}
 		compose := func(c []core.Candle, a smc.Analysis, idx int) meta.CompositeSignal {
 			if buf != nil {
-				return meta.ComposeSignalDynamic(c, a, idx, weights, cfg.ThresholdPercentile, buf, cfg.LondonFix)
+				return meta.ComposeSignalDynamic(c, a, idx, weights, cfg.ThresholdPercentile, buf, cfg.LondonFix, cfg.COMEXPin)
 			}
-			return meta.ComposeSignal(c, a, idx, weights, cfg.Threshold, cfg.LondonFix)
+			return meta.ComposeSignal(c, a, idx, weights, cfg.Threshold, cfg.LondonFix, cfg.COMEXPin)
 		}
 		oosTrades := SimulateOOS(oosCandles, params, compose)
 

@@ -100,3 +100,19 @@ func IsLiquidityFade(name string) bool {
 	}
 	return false
 }
+
+// IsMeanReversion reports whether a strategy enters at structural levels
+// expecting price to fade back toward equilibrium. Used by COMEXPinConfig
+// (Phase 3.2) to BOOST these strategies inside the 48h pre-expiry pinning
+// window: dealer gamma-hedging around the highest-OI strike pulls price
+// back like a magnet, which is exactly the regime fade-from-level setups
+// are built for. Distinct from IsLiquidityFade, which targets the
+// stop-hunt → snap-back signature of the London Fix rather than the
+// slower gravitational pinning of OI-magnet strikes.
+func IsMeanReversion(name string) bool {
+	switch name {
+	case "OrderBlockMit", "OTEFibonacci":
+		return true
+	}
+	return false
+}
