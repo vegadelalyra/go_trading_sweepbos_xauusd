@@ -671,6 +671,12 @@ func runWFA(args []string) int {
 	comexPreHours := fs.Int("comex-pre-hours", 48, "hours BEFORE each seeded GC expiry that the pinning regime kicks in")
 	comexMomMult := fs.Float64("comex-momentum-mult", 0.0, "weight multiplier for momentum strategies inside the COMEX pre-expiry window (0 silences them)")
 	comexFadeMult := fs.Float64("comex-fade-mult", 1.3, "weight multiplier for mean-reversion strategies inside the COMEX pre-expiry window (1.0 = neutral)")
+	dynamicSpread := fs.Bool("dynamic-spread", false, "use the synthetic intraday spread curve (Phase 4.1) instead of the constant SpreadDollar")
+	spreadBase := fs.Float64("spread-base", 0.32, "base spread in USD when -dynamic-spread is enabled (Admirals XAU Zero MT5 typical)")
+	spreadRollMult := fs.Float64("spread-rollover-mult", 3.0, "spread multiplier during the 17:00 NY daily rollover hour")
+	spreadNewsMult := fs.Float64("spread-news-mult", 2.0, "spread multiplier during NY news hours (08, 09, 10, 14)")
+	spreadFilter := fs.Bool("spread-filter", false, "reject signals when modelled spread spikes above -spread-filter-mult × SMA (Phase 4.2 stub)")
+	spreadFilterMult := fs.Float64("spread-filter-mult", 1.5, "ratio of current spread to trailing-SMA above which the filter rejects (>= 1.0)")
 	persist := fs.Bool("persist", false, "store this WFA run + every OOS trade in wfa_runs/wfa_trades")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -688,6 +694,15 @@ func runWFA(args []string) int {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
+	}
+	spreadCfg := engine.SpreadCurveConfig{
+		Enabled:       *dynamicSpread,
+		Base:          *spreadBase,
+		RolloverMult:  *spreadRollMult,
+		NewsMult:      *spreadNewsMult,
+		FilterEnabled: *spreadFilter,
+		FilterMult:    *spreadFilterMult,
+		FilterSMABars: 6,
 	}
 
 	ctx := context.Background()
@@ -735,6 +750,7 @@ func runWFA(args []string) int {
 		BayesShrink: *bayesShrink,
 		LondonFix:   lfCfg,
 		COMEXPin:    comexCfg,
+		SpreadCurve: spreadCfg,
 	}
 	candles, err := loadCandles(ctx, pool, cfg.Symbol, cfg.Interval, cfg.StartDate, cfg.EndDate)
 	if err != nil {
@@ -1185,6 +1201,12 @@ func runPaperLive(args []string) int {
 	comexPreHours := fs.Int("comex-pre-hours", 48, "hours BEFORE each seeded GC expiry that the pinning regime kicks in")
 	comexMomMult := fs.Float64("comex-momentum-mult", 0.0, "weight multiplier for momentum strategies inside the COMEX pre-expiry window (0 silences them)")
 	comexFadeMult := fs.Float64("comex-fade-mult", 1.3, "weight multiplier for mean-reversion strategies inside the COMEX pre-expiry window (1.0 = neutral)")
+	dynamicSpread := fs.Bool("dynamic-spread", false, "use the synthetic intraday spread curve (Phase 4.1) instead of the constant SpreadDollar")
+	spreadBase := fs.Float64("spread-base", 0.32, "base spread in USD when -dynamic-spread is enabled")
+	spreadRollMult := fs.Float64("spread-rollover-mult", 3.0, "spread multiplier during the 17:00 NY daily rollover hour")
+	spreadNewsMult := fs.Float64("spread-news-mult", 2.0, "spread multiplier during NY news hours (08, 09, 10, 14)")
+	spreadFilter := fs.Bool("spread-filter", false, "reject signals when modelled spread spikes above SMA (Phase 4.2 stub)")
+	spreadFilterMult := fs.Float64("spread-filter-mult", 1.5, "ratio of current spread to trailing-SMA above which the filter rejects (>= 1.0)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -1201,6 +1223,15 @@ func runPaperLive(args []string) int {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
+	}
+	spreadCfg := engine.SpreadCurveConfig{
+		Enabled:       *dynamicSpread,
+		Base:          *spreadBase,
+		RolloverMult:  *spreadRollMult,
+		NewsMult:      *spreadNewsMult,
+		FilterEnabled: *spreadFilter,
+		FilterMult:    *spreadFilterMult,
+		FilterSMABars: 6,
 	}
 	paperRunIDs, err := parsePaperRunIDs(*paperRun)
 	if err != nil {
@@ -1287,6 +1318,7 @@ func runPaperLive(args []string) int {
 		HTTPClient:          &http.Client{Timeout: 30 * time.Second},
 		LondonFix:           lfCfg,
 		COMEXPin:            comexCfg,
+		SpreadCurve:         spreadCfg,
 	}
 
 	fmt.Printf("═══ Paper Live — %s %s ═══\n", *symbol, *interval)

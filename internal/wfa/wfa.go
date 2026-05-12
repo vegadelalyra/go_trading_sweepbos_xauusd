@@ -81,6 +81,10 @@ type WFAConfig struct {
 	// a strict no-op — preserves the legacy ComposeSignal path bit-for-bit.
 	// See meta.COMEXPinConfig for the microstructural rationale.
 	COMEXPin meta.COMEXPinConfig
+	// SpreadCurve toggles the synthetic intraday spread curve + spike
+	// filter (Phase 4.1+4.2). Zero-value (Enabled=false) preserves the
+	// constant SpreadDollar everywhere. See engine.SpreadCurveConfig.
+	SpreadCurve engine.SpreadCurveConfig
 }
 
 // WFAWindow holds one IS→OOS slice plus the OOS-side performance.
@@ -145,6 +149,7 @@ func RunWFA(cfg WFAConfig, candles []core.Candle, h4Candles []core.Candle) (WFAR
 		params.SlippagePoints = cfg.Slippage
 		params.SlippageNewsMult = cfg.SlippageNewsMult
 		params.TripleBarrier = cfg.TripleBarrier
+		params.SpreadCurve = cfg.SpreadCurve
 
 		isResult := engine.RunBacktest(isCandles, strategy.All(), params)
 		weightsList := computeWeights(isResult.Trades)

@@ -59,6 +59,17 @@ type BacktestParams struct {
 	// global prior. Default nil = legacy behaviour, every strategy
 	// keeps its baked-in RR.
 	PerStrategyRR map[string]float64
+	// BarDuration is the wall-clock duration of one OHLC candle (5min,
+	// 15min, 1h, 4h). Set by ParamsFor; zero falls back to 5min for
+	// internal helpers that need to walk N bars backward in time (e.g.,
+	// the spread-spike filter's trailing SMA).
+	BarDuration time.Duration
+	// SpreadCurve, when Enabled, replaces the constant SpreadDollar with
+	// a time-of-day synthetic curve (rollover blow-out, news-window
+	// widening) and optionally rejects signals during spread-spike bars.
+	// Default zero-value (Enabled=false) preserves bit-for-bit legacy
+	// behaviour — the dynamic curve only kicks in when the caller opts in.
+	SpreadCurve SpreadCurveConfig
 }
 
 // TripleBarrierConfig parametrises the triple-barrier exit overlay. All
@@ -129,15 +140,19 @@ func ParamsFor(interval string) BacktestParams {
 		// avoid re-firing on the same chop.
 		p.MaxSLPoints = 30
 		p.MaxHoldCandles = 0
+		p.BarDuration = 5 * time.Minute
 	case "15m":
 		p.MaxSLPoints = 50
 		p.MaxHoldCandles = 0
+		p.BarDuration = 15 * time.Minute
 	case "1h":
 		p.MaxSLPoints = 100
 		p.MaxHoldCandles = 0
+		p.BarDuration = time.Hour
 	case "4h":
 		p.MaxSLPoints = 200
 		p.MaxHoldCandles = 0
+		p.BarDuration = 4 * time.Hour
 	}
 	return p
 }
@@ -319,10 +334,24 @@ func RunBacktest(candles []core.Candle, strategies []strategy.Strategy, p Backte
 					continue
 				}
 			}
+			// Spread-spike filter (Phase 4.2 stub on the synthetic curve;
+			// will gate against real broker telemetry once paper-live
+			// records bid/ask via FIX). Reject pre-entry when modelled
+			// spread is more than FilterMult × trailing SMA — the engine
+			// pretends to be a careful trader who walks away from
+			// rollover gaps and news-print blow-outs.
+			barDur := p.BarDuration
+			if barDur <= 0 {
+				barDur = 5 * time.Minute
+			}
+			if p.SpreadCurve.SpreadSpike(c.Time, barDur) {
+				continue
+			}
+			spread := p.SpreadCurve.EffectiveSpread(c.Time, p.SpreadDollar)
 			if sig.Side == core.Long {
-				sig.Entry += p.SpreadDollar
+				sig.Entry += spread
 			} else {
-				sig.Entry -= p.SpreadDollar
+				sig.Entry -= spread
 			}
 			t := core.Trade{
 				Strategy:  sig.Strategy,
@@ -501,6 +530,7 @@ func bumpStats(m map[string]StrategyStats, key string, t core.Trade) {
 // final leg. This matches the existing engine's convention.
 func AdvanceTrade(open *core.Trade, c core.Candle, i int, p BacktestParams) bool {
 	slip := SLPenalty(p, c.Time)
+	spread := p.SpreadCurve.EffectiveSpread(c.Time, p.SpreadDollar)
 	tb := p.TripleBarrier
 	tbActive := tb.Enabled && tb.PartialR > 0
 
@@ -511,7 +541,7 @@ func AdvanceTrade(open *core.Trade, c core.Candle, i int, p BacktestParams) bool
 			if open.Side == core.Long {
 				target := open.Entry + tb.PartialR*riskDist
 				if c.High >= target {
-					fill := target - p.SpreadDollar
+					fill := target - spread
 					open.PartialR = (fill - open.Entry) / riskDist
 					open.PartialExitPrice = fill
 					open.PartialExitIdx = i
@@ -521,7 +551,7 @@ func AdvanceTrade(open *core.Trade, c core.Candle, i int, p BacktestParams) bool
 			} else {
 				target := open.Entry - tb.PartialR*riskDist
 				if c.Low <= target {
-					fill := target + p.SpreadDollar
+					fill := target + spread
 					open.PartialR = (open.Entry - fill) / riskDist
 					open.PartialExitPrice = fill
 					open.PartialExitIdx = i
@@ -555,7 +585,7 @@ func AdvanceTrade(open *core.Trade, c core.Candle, i int, p BacktestParams) bool
 				// SL has been moved to entry (BE) — clean BE exit, no
 				// slippage modelled on the BE itself because there is no
 				// stop-hunting penalty when the stop is AT the entry.
-				finalize(open.SL-p.SpreadDollar, 0, false)
+				finalize(open.SL-spread, 0, false)
 				return true
 			}
 			if slip > 0 {
@@ -563,24 +593,24 @@ func AdvanceTrade(open *core.Trade, c core.Candle, i int, p BacktestParams) bool
 				if c.Low < exit {
 					exit = c.Low
 				}
-				actualLoss := open.Entry - exit + p.SpreadDollar
-				finalize(exit-p.SpreadDollar, -actualLoss/riskDist, false)
+				actualLoss := open.Entry - exit + spread
+				finalize(exit-spread, -actualLoss/riskDist, false)
 			} else {
-				finalize(open.SL-p.SpreadDollar, -1, false)
+				finalize(open.SL-spread, -1, false)
 			}
 			return true
 		}
 		if c.High >= open.TP {
 			riskDist := math.Abs(open.Entry - origSL(open, tbActive))
 			finalLegR := (open.TP - open.Entry) / riskDist
-			finalize(open.TP-p.SpreadDollar, finalLegR, true)
+			finalize(open.TP-spread, finalLegR, true)
 			return true
 		}
 	} else {
 		if c.High >= open.SL {
 			riskDist := open.SL - open.Entry
 			if open.PartialR != 0 {
-				finalize(open.SL+p.SpreadDollar, 0, false)
+				finalize(open.SL+spread, 0, false)
 				return true
 			}
 			if slip > 0 {
@@ -588,17 +618,17 @@ func AdvanceTrade(open *core.Trade, c core.Candle, i int, p BacktestParams) bool
 				if c.High > exit {
 					exit = c.High
 				}
-				actualLoss := exit - open.Entry + p.SpreadDollar
-				finalize(exit+p.SpreadDollar, -actualLoss/riskDist, false)
+				actualLoss := exit - open.Entry + spread
+				finalize(exit+spread, -actualLoss/riskDist, false)
 			} else {
-				finalize(open.SL+p.SpreadDollar, -1, false)
+				finalize(open.SL+spread, -1, false)
 			}
 			return true
 		}
 		if c.Low <= open.TP {
 			riskDist := math.Abs(origSL(open, tbActive) - open.Entry)
 			finalLegR := (open.Entry - open.TP) / riskDist
-			finalize(open.TP+p.SpreadDollar, finalLegR, true)
+			finalize(open.TP+spread, finalLegR, true)
 			return true
 		}
 	}

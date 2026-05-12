@@ -48,6 +48,12 @@ type LiveConfig struct {
 	// legacy paper-live run stays bit-for-bit identical until COMEX is
 	// opted in. See meta.COMEXPinConfig for the microstructural rationale.
 	COMEXPin meta.COMEXPinConfig
+	// SpreadCurve toggles the synthetic intraday spread curve + spike
+	// filter (Phase 4.1+4.2). When Enabled, the engine sees a time-of-day
+	// spread instead of the constant SpreadDollar, and the spread-spike
+	// filter rejects signals during modelled blow-outs. Zero-value is a
+	// strict no-op.
+	SpreadCurve engine.SpreadCurveConfig
 }
 
 // pendingPosition mirrors a paper_pending row for in-memory grading. We
@@ -248,6 +254,7 @@ func buildLiveParams(cfg LiveConfig) engine.BacktestParams {
 	p.PDLookback = cfg.PDLookback
 	p.SlippagePoints = cfg.Slippage
 	p.SlippageNewsMult = cfg.SlippageNewsMult
+	p.SpreadCurve = cfg.SpreadCurve
 	return p
 }
 
