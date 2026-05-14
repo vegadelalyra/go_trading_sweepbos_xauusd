@@ -1259,6 +1259,7 @@ func runPaperLive(args []string) int {
 	spreadNewsMult := fs.Float64("spread-news-mult", 2.0, "spread multiplier during NY news hours (08, 09, 10, 14)")
 	spreadFilter := fs.Bool("spread-filter", false, "reject signals when modelled spread spikes above SMA (Phase 4.2 stub)")
 	spreadFilterMult := fs.Float64("spread-filter-mult", 1.5, "ratio of current spread to trailing-SMA above which the filter rejects (>= 1.0)")
+	greensSince := fs.Duration("greens-since", 0, "if > 0, print ENTRY-tier (|net|≥2.0) signals from the last <duration> and exit (e.g. 5m, 1h, 24h). Capped at 24h. Pure read-only.")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -1383,6 +1384,16 @@ func runPaperLive(args []string) int {
 		LondonFix:           lfCfg,
 		COMEXPin:            comexCfg,
 		SpreadCurve:         spreadCfg,	}
+
+	if *greensSince > 0 {
+		fmt.Printf("═══ Recent Green Signals — %s %s  (last %s) ═══\n", *symbol, *interval, *greensSince)
+		fmt.Printf("  Source weights: backtest_runs.id=%d  ·  bySession=%t\n\n", id, *bySession)
+		if err := paper.ReplayGreens(ctx, pool, cfg, flat, bySessTbl, *greensSince, stdoutLogger{}); err != nil {
+			fmt.Fprintf(os.Stderr, "greens: %v\n", err)
+			return 1
+		}
+		return 0
+	}
 
 	fmt.Printf("═══ Paper Live — %s %s ═══\n", *symbol, *interval)
 	gate := fmt.Sprintf("threshold=%.2f", *threshold)

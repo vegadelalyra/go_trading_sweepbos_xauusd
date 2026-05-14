@@ -694,30 +694,61 @@ func replayMissedSignals(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig
 		log.Log("replay: gap %s ≤ interval %s — nothing to replay", gap.Round(time.Second), intervalDur)
 		return nil
 	}
+	return scanGreenSignals(ctx, pool, cfg, compose, params, intervalDur, *lastEnded, now, "since-last-shutdown", log)
+}
+
+// ReplayGreens prints a digest of ENTRY-tier signals (|net|≥2.0) for the
+// last `window` of closed bars and returns. Pure read-only — never touches
+// paper_pending or paper_runs. `window` is capped at 24h to match
+// TwelveData free-tier history limits.
+func ReplayGreens(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig,
+	weights map[string]float64, weightsBySession map[string]map[string]float64,
+	window time.Duration, log Logger) error {
+
+	if window <= 0 {
+		return fmt.Errorf("ReplayGreens: window must be > 0")
+	}
+	params := buildLiveParams(cfg)
+	intervalDur := intervalDuration(cfg.Interval)
+	if intervalDur <= 0 {
+		return fmt.Errorf("unsupported interval %q", cfg.Interval)
+	}
+	store := newWeightStore(weights, weightsBySession, cfg.SourceRunID)
+	compose := buildComposer(cfg, store)
+	now := time.Now().UTC()
+	return scanGreenSignals(ctx, pool, cfg, compose, params, intervalDur, now.Add(-window), now, "on-demand", log)
+}
+
+// scanGreenSignals is the shared body of replayMissedSignals and ReplayGreens.
+// Walks closed bars in [from, to], recomposes each signal, and logs one
+// `MISSED` line per match with |NetWeight| ≥ replayEntryNetAbs.
+func scanGreenSignals(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig,
+	compose func([]core.Candle, smc.Analysis, int) meta.CompositeSignal,
+	params engine.BacktestParams, intervalDur time.Duration,
+	from, to time.Time, reason string, log Logger) error {
+
+	if !to.After(from) {
+		log.Log("replay: range [%s → %s] is empty — nothing to scan",
+			from.Format("2006-01-02 15:04 UTC"), to.Format("2006-01-02 15:04 UTC"))
+		return nil
+	}
 	capped := false
-	if gap > replayMaxWindow {
-		gap = replayMaxWindow
+	if to.Sub(from) > replayMaxWindow {
+		from = to.Add(-replayMaxWindow)
 		capped = true
 	}
-	fromTime := now.Add(-gap)
-	if fromTime.Before(*lastEnded) {
-		fromTime = *lastEnded
-	}
+	gap := to.Sub(from)
 	if capped {
-		log.Log("replay: scanning ENTRY signals (|net|≥%.1f) %s → %s (24h cap; last ended_at=%s)",
+		log.Log("replay: scanning ENTRY signals (|net|≥%.1f) %s → %s (%s, 24h cap)",
 			replayEntryNetAbs,
-			fromTime.Format("2006-01-02 15:04 UTC"), now.Format("2006-01-02 15:04 UTC"),
-			lastEnded.Format("2006-01-02 15:04 UTC"))
+			from.Format("2006-01-02 15:04 UTC"), to.Format("2006-01-02 15:04 UTC"), reason)
 	} else {
-		log.Log("replay: scanning ENTRY signals (|net|≥%.1f) %s → %s (gap %s)",
+		log.Log("replay: scanning ENTRY signals (|net|≥%.1f) %s → %s (%s, gap %s)",
 			replayEntryNetAbs,
-			fromTime.Format("2006-01-02 15:04 UTC"), now.Format("2006-01-02 15:04 UTC"),
-			gap.Round(time.Minute))
+			from.Format("2006-01-02 15:04 UTC"), to.Format("2006-01-02 15:04 UTC"),
+			reason, gap.Round(time.Minute))
 	}
 
-	// Fetch enough closed candles from TwelveData to cover the gap, plus a
-	// small padding for safety. Free tier allows up to 5000 per request, so
-	// even a 24h 5m window (288 bars) is one call.
 	barsNeeded := int(gap/intervalDur) + replayFetchPadding
 	fetched, err := livefeed.FetchLatest(ctx, cfg.HTTPClient, cfg.APIKey, cfg.Symbol, cfg.Interval, barsNeeded)
 	if err != nil {
@@ -737,7 +768,7 @@ func replayMissedSignals(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig
 		return nil
 	}
 
-	lastClosedIdx := closedBarIndex(candles, intervalDur, now)
+	lastClosedIdx := closedBarIndex(candles, intervalDur, to)
 	if lastClosedIdx < 0 {
 		log.Log("replay: no closed bars available")
 		return nil
@@ -747,7 +778,7 @@ func replayMissedSignals(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig
 	found := 0
 	for i := params.MinIndex; i <= lastClosedIdx; i++ {
 		bt := candles[i].Time
-		if !bt.After(fromTime) {
+		if !bt.After(from) {
 			continue
 		}
 		cs := compose(candles, a, i)
@@ -767,7 +798,7 @@ func replayMissedSignals(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig
 	if found == 0 {
 		log.Log("replay: no ENTRY-tier signals in window")
 	} else {
-		log.Log("replay: %d missed ENTRY signal(s) since last shutdown", found)
+		log.Log("replay: %d ENTRY signal(s) in window", found)
 	}
 	return nil
 }
