@@ -120,6 +120,11 @@ func loadCandles(ctx context.Context, pool *pgxpool.Pool, symbol, interval strin
 		if err := rows.Scan(&c.Time, &c.Open, &c.High, &c.Low, &c.Close); err != nil {
 			return nil, err
 		}
+		// pgx returns timestamptz in the connection's local location (UTC-5
+		// here); normalize to UTC so every downstream Time.Format(...) prints
+		// true UTC. Instant-preserving — all hour/session logic re-derives via
+		// .UTC()/ToNY, so this fixes labels only, never behavior.
+		c.Time = c.Time.UTC()
 		out = append(out, c)
 	}
 	return out, rows.Err()

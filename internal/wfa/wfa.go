@@ -91,6 +91,21 @@ type WFAConfig struct {
 	// already be populated by the CLI loader before RunWFA is invoked —
 	// this package never touches the ohlc table.
 	DXY meta.DXYFilterConfig
+	// SkipStrategies, when non-empty, forces the named strategies to weight
+	// zero before the composer sees them — emulating "what if we removed
+	// this strategy from the voting pool" without touching the registry.
+	// Their IS trades still feed weight computation (so the IS panel stays
+	// comparable across runs) but their OOS contribution is silenced.
+	// Default nil = legacy behaviour, every strategy votes with its
+	// Sharpe-derived weight.
+	SkipStrategies map[string]bool
+	// CapStrategies multiplies the Sharpe-derived weight of the named
+	// strategies before the composer sees them. Use 1.0 (or omit) to
+	// disable; <1 dampens (e.g. 0.5 = half weight); 0 is equivalent to
+	// SkipStrategies. Applied AFTER SkipStrategies (skip wins). Lets a
+	// dominant high-frequency strategy keep voting on bars where it
+	// fires alone but lose tie-breaks vs higher-quality co-firers.
+	CapStrategies map[string]float64
 }
 
 // WFAWindow holds one IS→OOS slice plus the OOS-side performance.
@@ -162,6 +177,17 @@ func RunWFA(cfg WFAConfig, candles []core.Candle, h4Candles []core.Candle) (WFAR
 		weights := make(map[string]float64, len(weightsList))
 		for _, w := range weightsList {
 			weights[w.Strategy] = w.Weight
+		}
+		for name := range cfg.SkipStrategies {
+			weights[name] = 0
+		}
+		for name, mult := range cfg.CapStrategies {
+			if cfg.SkipStrategies[name] {
+				continue
+			}
+			if w, ok := weights[name]; ok {
+				weights[name] = w * mult
+			}
 		}
 
 		// Bayesian shrinkage of per-strategy RR (Phase 2.1, opt-in).

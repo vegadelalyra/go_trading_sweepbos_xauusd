@@ -97,15 +97,26 @@ func shouldAutoRefresh(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig, 
 		return false, time.Time{}, err
 	}
 	if lastRefresh == nil {
-		// No canonical row yet for this (symbol, interval). Bootstrap by
-		// refreshing — but only if we're in a trading instant so we don't
-		// burn 30-60s of compute on a market-closed Saturday.
-		return marketcal.IsXAUUSDTradingDay(now), time.Time{}, nil
+		// No canonical row yet for this (symbol, interval). Always
+		// bootstrap — even on a market-closed weekend — so the very first
+		// startup is never left without a weight table.
+		return true, time.Time{}, nil
 	}
+	// -force-refresh bypasses the staleness guard entirely: rebuild the
+	// canonical on this startup no matter how fresh the last one is. Used
+	// after a manual backfill to retrain on freshly-completed data without
+	// waiting for the next trading day.
+	if cfg.ForceRefresh {
+		return true, *lastRefresh, nil
+	}
+	// Fire whenever at least one trading day has elapsed since the last
+	// canonical, regardless of whether *today* is itself a trading instant.
+	// A weekend or holiday startup after a stale week still rebuilds the
+	// weights and pulls the missing-day OHLC gap; runAutoRefresh sizes the
+	// fetch to the gap (capped by the API rate budget). The staleness check
+	// below is the only guard — it stops redundant re-runs when the canonical
+	// is already current, so restarting twice in one day is a no-op.
 	if marketcal.TradingDaysSince(*lastRefresh, now) < 1 {
-		return false, *lastRefresh, nil
-	}
-	if !marketcal.IsXAUUSDTradingDay(now) {
 		return false, *lastRefresh, nil
 	}
 	return true, *lastRefresh, nil
@@ -119,15 +130,61 @@ func shouldAutoRefresh(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig, 
 // weights.
 func runAutoRefresh(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig,
 	currentRunID int64, store *weightStore, paperRunIDs []int64,
-	deps RefreshDeps, log Logger) {
+	deps RefreshDeps, lastRefresh time.Time, log Logger) {
 
 	t0 := time.Now()
 	log.Log("auto-refresh: starting WFA in background (current run-id=%d)", currentRunID)
 
-	// 1. Pull any OHLC tail that's missing. We ask for a large window
-	//    (~2 trading days = 576 5m bars + padding) to cover weekend gaps
-	//    after a Monday startup. TwelveData caps at 5000/req on free.
-	tailBars := 600
+	// 1. Pull any OHLC tail that's missing. Size the request to the ACTUAL
+	//    gap between the newest stored candle and now, so a multi-day outage
+	//    (weekend, vacation, forgot to run the script) is filled in one shot
+	//    instead of just the last ~2 days. TwelveData's free tier caps
+	//    outputsize at 5000 bars per request (~17 calendar days on 5m); a
+	//    gap larger than that needs a paginated `backfill` and we log a hint.
+	//    Floor at 600 so even a tiny gap still pulls enough padding for the
+	//    WFA's trailing indicators.
+	const (
+		maxTailBars = 5000 // TwelveData free-tier single-request outputsize cap
+		minTailBars = 600
+	)
+	tailBars := minTailBars
+	if dur := intervalDuration(cfg.Interval); dur > 0 {
+		// We size the fetch to the LARGER of two gap signals:
+		//   (a) trailing gap — how far the newest stored candle is behind now;
+		//   (b) canonical staleness — how long since the last successful
+		//       refresh, i.e. the whole window over which sporadic polling may
+		//       have left INTERIOR holes (e.g. the script ran a few minutes a
+		//       day so middle days are empty even though the newest bar is
+		//       current). MAX(bar_time) alone is blind to interior holes, so
+		//       (b) is what actually covers a "ran briefly each day" pattern.
+		span := time.Duration(0)
+		if !lastRefresh.IsZero() {
+			span = t0.Sub(lastRefresh)
+		}
+		var lastBar *time.Time
+		if err := pool.QueryRow(ctx, `
+			SELECT MAX(bar_time) FROM ohlc WHERE symbol = $1 AND interval = $2`,
+			cfg.Symbol, cfg.Interval).Scan(&lastBar); err != nil {
+			log.Log("auto-refresh: gap probe failed: %v — using default tail of %d bars", err, minTailBars)
+		} else if lastBar != nil {
+			if trailing := t0.Sub(*lastBar); trailing > span {
+				span = trailing
+			}
+		}
+		// +50 bars padding covers the currently-open bar plus slack so a
+		// boundary-aligned fetch never comes up one candle short.
+		if span > 0 {
+			if gapBars := int(span/dur) + 50; gapBars > tailBars {
+				tailBars = gapBars
+			}
+		}
+	}
+	if tailBars > maxTailBars {
+		log.Log("auto-refresh: gap needs %d bars but the API caps a single request at %d — fetching %d; run `backfill -interval=%s` to fill the remainder",
+			tailBars, maxTailBars, maxTailBars, cfg.Interval)
+		tailBars = maxTailBars
+	}
+	log.Log("auto-refresh: fetching up to %d-bar OHLC tail to cover the gap", tailBars)
 	if fetched, err := livefeed.FetchLatest(ctx, cfg.HTTPClient, cfg.APIKey, cfg.Symbol, cfg.Interval, tailBars); err != nil {
 		log.Log("auto-refresh: tail-fetch failed: %v — proceeding with DB-only history", err)
 	} else if len(fetched) > 0 {

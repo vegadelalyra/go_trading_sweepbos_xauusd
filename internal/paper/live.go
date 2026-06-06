@@ -17,6 +17,7 @@ import (
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/livefeed"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/marketcal"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/meta"
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/notify"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/smc"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy"
 )
@@ -53,6 +54,16 @@ type LiveConfig struct {
 	// DXY (Phase 3.3) is the intermarket-divergence weight adjustment.
 	// Zero-value (Enabled=false) is a no-op.
 	DXY meta.DXYFilterConfig
+	// ForceRefresh bypasses the staleness gate in shouldAutoRefresh so the
+	// auto-refresh WFA fires on startup even when the latest canonical is
+	// less than one trading day old. Use after a manual backfill to rebuild
+	// the canonical on freshly-completed data without waiting for the next
+	// trading day.
+	ForceRefresh bool
+	// Notifier, when non-nil, receives one GreenAlert per ENTRY-tier signal
+	// (|net| ≥ 2.0) the instant it fires in the live loop. Zero-value (nil)
+	// disables notifications — every legacy run stays bit-for-bit identical.
+	Notifier notify.Notifier
 }
 
 // pendingPosition mirrors a paper_pending row for in-memory grading. We
@@ -114,7 +125,7 @@ func RunLive(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig,
 				marketcal.IsXAUUSDTradingDay(startupForRefresh))
 		}
 	} else {
-		go runAutoRefresh(ctx, pool, cfg, cfg.SourceRunID, store, paperRunIDs, RefreshDeps{}, log)
+		go runAutoRefresh(ctx, pool, cfg, cfg.SourceRunID, store, paperRunIDs, RefreshDeps{}, lastRefresh, log)
 	}
 
 	// Replay any ENTRY-tier signals (|net|≥2.0) that closed since the last
@@ -271,6 +282,35 @@ func RunLive(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig,
 						log.Log("%s #%d  %s  %s  entry=%.2f  SL=%.2f  TP=%.2f  |  net=%+.2f  vote=%.2f  (%s)",
 							label, pendID, cs.Side.String(), p.Strategy, p.Entry, p.SL, p.TP,
 							cs.NetWeight, cs.AppliedThreshold, cs.WinnerStrategy)
+
+						// Green alert (buena): push to the out-of-band notifier
+						// the instant a strong-conviction ENTRY fires. Fire-and-
+						// forget in a goroutine so a slow or down wpp bot never
+						// stalls the poll loop; errors are logged, never fatal —
+						// same discipline as shadow recording below. Only the
+						// ENTRY tier (|net| ≥ 2.0) notifies; MED/WEAK stay silent.
+						if absNet >= 2.0 && cfg.Notifier != nil {
+							alert := notify.GreenAlert{
+								PendingID: pendID,
+								Time:      latestClosed.Time,
+								Symbol:    cfg.Symbol,
+								Interval:  cfg.Interval,
+								Side:      cs.Side,
+								Strategy:  p.Strategy,
+								Entry:     p.Entry,
+								SL:        p.SL,
+								TP:        p.TP,
+								NetWeight: cs.NetWeight,
+								Threshold: cs.AppliedThreshold,
+							}
+							go func() {
+								nctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+								defer cancel()
+								if err := cfg.Notifier.Notify(nctx, alert); err != nil {
+									log.Log("wpp notify error (alert #%d): %v", alert.PendingID, err)
+								}
+							}()
+						}
 					}
 				} else {
 					log.Log("REJECT %s by %s — %s  |  net=%+.2f  vote=%.2f",
@@ -727,6 +767,10 @@ func scanGreenSignals(ctx context.Context, pool *pgxpool.Pool, cfg LiveConfig,
 	params engine.BacktestParams, intervalDur time.Duration,
 	from, to time.Time, reason string, log Logger) error {
 
+	// from may arrive as paper_runs.ended_at in pgx-local location; normalize
+	// so the "scanning … UTC" banner shows true UTC. Instant-preserving.
+	from, to = from.UTC(), to.UTC()
+
 	if !to.After(from) {
 		log.Log("replay: range [%s → %s] is empty — nothing to scan",
 			from.Format("2006-01-02 15:04 UTC"), to.Format("2006-01-02 15:04 UTC"))
@@ -857,6 +901,9 @@ func loadAllCandles(ctx context.Context, pool *pgxpool.Pool, symbol, interval st
 		if err := rows.Scan(&c.Time, &c.Open, &c.High, &c.Low, &c.Close); err != nil {
 			return nil, err
 		}
+		// Normalize pgx's local-location timestamptz to UTC so BAR/MISSED logs
+		// print true UTC (matching the WhatsApp alert). Instant-preserving.
+		c.Time = c.Time.UTC()
 		out = append(out, c)
 	}
 	return out, rows.Err()

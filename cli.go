@@ -24,6 +24,7 @@ import (
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/core"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/engine"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/meta"
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/notify"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/paper"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/smc"
 	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy"
@@ -69,6 +70,8 @@ func run(args []string) int {
 		return runLiveSignal(args[2:])
 	case "import-cache":
 		return runImportCache(args[2:])
+	case "wpp-send":
+		return runWppSend(args[2:])
 	case "-h", "--help", "help":
 		printUsage()
 		return 0
@@ -100,14 +103,21 @@ SUBCOMMANDS
   capital-sim   simulate a fixed-risk + martingale capital scheme over a stored run's trades, per strategy
   live-signal   stream live ticks (TD WSS) and recompose the signal on REST polls
   import-cache  one-shot import of the legacy JSON cache into Postgres
+  wpp-send      send a one-off WhatsApp message via a running go_wpp_bot instance
 
-FLAGS for `+"`backfill`"+`
+FLAGS for ` + "`wpp-send`" + `
+  -phone       destination number, country code, no + (default 573137054945)
+  -endpoint    go_wpp_bot send endpoint (default http://127.0.0.1:8080/api/send)
+  -message     message text; if omitted, positional args are joined
+               e.g. sweepbos wpp-send "hola desde la CLI"
+
+FLAGS for ` + "`backfill`" + `
   -symbol      default XAU/USD
   -interval    "15m", "1h", "4h", or "all" (runs all three).  Default: all
   -years       how many years back to fetch.                  Default: 2
   -pages       safety cap on TD pages per interval.           Default: 50
 
-FLAGS for `+"`import-cache`"+`
+FLAGS for ` + "`import-cache`" + `
   -file        path to legacy cache_xauusd_15m.json.          Default: ./cache_xauusd_15m.json
   -symbol      default XAU/USD
   -interval    default 15m
@@ -241,6 +251,8 @@ func runBacktestCLI(args []string) int {
 	slippage := fs.Float64("slippage", 0, "SL slippage in dollars (0 disables)")
 	slippageNewsMult := fs.Float64("slippage-news-mult", 1.0, "multiplier applied to slippage in news windows")
 	useXAG := fs.Bool("xag", false, "load XAG/USD candles for the XAUXAGPairs strategy")
+	onlyStrategy := fs.String("only-strategy", "", "if set, run the engine with only this strategy (e.g. OrderBlockMit); '' = all registered strategies")
+	skipStrategy := fs.String("skip-strategy", "", "comma-separated list of strategy names to exclude from the registry (e.g. FVGFill,DailyBreakout); '' = none skipped")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -323,7 +335,40 @@ func runBacktestCLI(args []string) int {
 			fmt.Printf("XAG candles loaded (%d 1h bars) — XAUXAGPairs active\n", len(xag))
 		}
 	}
-	result := engine.RunBacktest(candles, strategy.All(), params)
+	strats := strategy.All()
+	if *onlyStrategy != "" {
+		s, ok := strategy.ByName(*onlyStrategy)
+		if !ok {
+			fmt.Fprintf(os.Stderr, "unknown strategy %q\n", *onlyStrategy)
+			return 2
+		}
+		strats = []strategy.Strategy{s}
+		fmt.Printf("Strategy filter ON  (only %s)\n", *onlyStrategy)
+	}
+	if *skipStrategy != "" {
+		skip := map[string]bool{}
+		for _, n := range strings.Split(*skipStrategy, ",") {
+			n = strings.TrimSpace(n)
+			if n == "" {
+				continue
+			}
+			if _, ok := strategy.ByName(n); !ok {
+				fmt.Fprintf(os.Stderr, "unknown strategy in -skip-strategy: %q\n", n)
+				return 2
+			}
+			skip[n] = true
+		}
+		filtered := strats[:0]
+		for _, s := range strats {
+			if skip[s.Meta().Name] {
+				continue
+			}
+			filtered = append(filtered, s)
+		}
+		strats = filtered
+		fmt.Printf("Strategy skip ON  (excluded: %s)\n", *skipStrategy)
+	}
+	result := engine.RunBacktest(candles, strats, params)
 	printBacktestReport(*symbol, *interval, result)
 
 	if *persist {
@@ -609,7 +654,8 @@ func runSignal(args []string) int {
 			}
 		} else {
 			compose = func(i int) meta.CompositeSignal {
-				return meta.ComposeSignalBySession(candles, a, i, ws, *threshold, meta.LondonFixConfig{}, meta.COMEXPinConfig{}, nil)			}
+				return meta.ComposeSignalBySession(candles, a, i, ws, *threshold, meta.LondonFixConfig{}, meta.COMEXPinConfig{}, nil)
+			}
 		}
 	} else {
 		ws, err := meta.LoadWeights(ctx, pool, id, paperRunIDs...)
@@ -624,7 +670,8 @@ func runSignal(args []string) int {
 			}
 		} else {
 			compose = func(i int) meta.CompositeSignal {
-				return meta.ComposeSignal(candles, a, i, weights, *threshold, meta.LondonFixConfig{}, meta.COMEXPinConfig{}, nil)			}
+				return meta.ComposeSignal(candles, a, i, weights, *threshold, meta.LondonFixConfig{}, meta.COMEXPinConfig{}, nil)
+			}
 		}
 	}
 
@@ -714,6 +761,8 @@ func runWFA(args []string) int {
 	spreadNewsMult := fs.Float64("spread-news-mult", 2.0, "spread multiplier during NY news hours (08, 09, 10, 14)")
 	spreadFilter := fs.Bool("spread-filter", false, "reject signals when modelled spread spikes above -spread-filter-mult × SMA (Phase 4.2 stub)")
 	spreadFilterMult := fs.Float64("spread-filter-mult", 1.5, "ratio of current spread to trailing-SMA above which the filter rejects (>= 1.0)")
+	skipStrategy := fs.String("skip-strategy", "", "comma-separated list of strategy names to silence in the composer (weight forced to 0); '' = legacy")
+	capStrategy := fs.String("cap-strategy", "", "comma-separated \"name:mult\" pairs to scale a strategy's composer weight (e.g. FVGFill:0.7); '' = legacy")
 	persist := fs.Bool("persist", false, "store this WFA run + every OOS trade in wfa_runs/wfa_trades")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -764,7 +813,8 @@ func runWFA(args []string) int {
 			fmt.Fprintln(os.Stderr, "comex_expiry is empty — apply schema/005_comex_expiry.sql first")
 			return 1
 		}
-		comexCfg.ExpiryDates = dates	}
+		comexCfg.ExpiryDates = dates
+	}
 
 	cfg := wfa.WFAConfig{
 		Symbol: *symbol, Interval: *interval,
@@ -786,7 +836,51 @@ func runWFA(args []string) int {
 		BayesShrink: *bayesShrink,
 		LondonFix:   lfCfg,
 		COMEXPin:    comexCfg,
-		SpreadCurve: spreadCfg,	}
+		SpreadCurve: spreadCfg,
+	}
+	if *skipStrategy != "" {
+		skip := map[string]bool{}
+		for _, n := range strings.Split(*skipStrategy, ",") {
+			n = strings.TrimSpace(n)
+			if n == "" {
+				continue
+			}
+			if _, ok := strategy.ByName(n); !ok {
+				fmt.Fprintf(os.Stderr, "unknown strategy in -skip-strategy: %q\n", n)
+				return 2
+			}
+			skip[n] = true
+		}
+		cfg.SkipStrategies = skip
+		fmt.Printf("WFA skip-strategy ON  (silenced: %s)\n", *skipStrategy)
+	}
+	if *capStrategy != "" {
+		caps := map[string]float64{}
+		for _, pair := range strings.Split(*capStrategy, ",") {
+			pair = strings.TrimSpace(pair)
+			if pair == "" {
+				continue
+			}
+			parts := strings.SplitN(pair, ":", 2)
+			if len(parts) != 2 {
+				fmt.Fprintf(os.Stderr, "invalid -cap-strategy entry %q (expected name:mult)\n", pair)
+				return 2
+			}
+			name := strings.TrimSpace(parts[0])
+			if _, ok := strategy.ByName(name); !ok {
+				fmt.Fprintf(os.Stderr, "unknown strategy in -cap-strategy: %q\n", name)
+				return 2
+			}
+			mult, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+			if err != nil || mult < 0 {
+				fmt.Fprintf(os.Stderr, "invalid multiplier in -cap-strategy %q: %v\n", pair, err)
+				return 2
+			}
+			caps[name] = mult
+		}
+		cfg.CapStrategies = caps
+		fmt.Printf("WFA cap-strategy ON  (%s)\n", *capStrategy)
+	}
 	candles, err := loadCandles(ctx, pool, cfg.Symbol, cfg.Interval, cfg.StartDate, cfg.EndDate)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load candles: %v\n", err)
@@ -819,7 +913,8 @@ func runWFA(args []string) int {
 	}
 	if comexCfg.Enabled {
 		fmt.Printf("  COMEX Pinning: ON  pre=%dh  momentum×%.2f  fade×%.2f  expiries=%d\n",
-			comexCfg.PreWindowHours, comexCfg.MomentumMult, comexCfg.FadeMult, len(comexCfg.ExpiryDates))	}
+			comexCfg.PreWindowHours, comexCfg.MomentumMult, comexCfg.FadeMult, len(comexCfg.ExpiryDates))
+	}
 	fmt.Println()
 	fmt.Printf("  %-3s  %-19s  %-19s  %-5s  %-7s  %-7s  %-7s\n",
 		"#", "OOS Start", "OOS End", "N", "WR%", "NetR", "Sharpe")
@@ -1047,8 +1142,8 @@ func runPaperReplay(args []string) int {
 	}
 
 	var (
-		flat       map[string]float64
-		bySessTbl  map[string]map[string]float64
+		flat      map[string]float64
+		bySessTbl map[string]map[string]float64
 	)
 	if *bySession {
 		bySessTbl, err = meta.LoadWeightsBySession(ctx, pool, id, paperRunIDs...)
@@ -1260,6 +1355,10 @@ func runPaperLive(args []string) int {
 	spreadFilter := fs.Bool("spread-filter", false, "reject signals when modelled spread spikes above SMA (Phase 4.2 stub)")
 	spreadFilterMult := fs.Float64("spread-filter-mult", 1.5, "ratio of current spread to trailing-SMA above which the filter rejects (>= 1.0)")
 	greensSince := fs.Duration("greens-since", 0, "if > 0, print ENTRY-tier (|net|≥2.0) signals from the last <duration> and exit (e.g. 5m, 1h, 24h). Capped at 24h. Pure read-only.")
+	forceRefresh := fs.Bool("force-refresh", false, "rebuild the canonical WFA on startup even if the latest one is <1 trading day old (use after a manual backfill to retrain on completed data)")
+	wppNotify := fs.Bool("wpp-notify", false, "push a WhatsApp message for every ENTRY-tier green signal (|net|≥2.0) via a running go_wpp_bot instance")
+	wppPhone := fs.String("wpp-phone", "573137054945", "destination WhatsApp number for -wpp-notify (country code, no + or suffix)")
+	wppEndpoint := fs.String("wpp-endpoint", "http://127.0.0.1:8080/api/send", "go_wpp_bot send endpoint for -wpp-notify")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -1368,7 +1467,8 @@ func runPaperLive(args []string) int {
 			fmt.Fprintln(os.Stderr, "comex_expiry is empty — apply schema/005_comex_expiry.sql first")
 			return 1
 		}
-		comexCfg.ExpiryDates = dates	}
+		comexCfg.ExpiryDates = dates
+	}
 
 	cfg := paper.LiveConfig{
 		SourceRunID: id, BySession: *bySession,
@@ -1383,7 +1483,19 @@ func runPaperLive(args []string) int {
 		HTTPClient:          &http.Client{Timeout: 30 * time.Second},
 		LondonFix:           lfCfg,
 		COMEXPin:            comexCfg,
-		SpreadCurve:         spreadCfg,	}
+		SpreadCurve:         spreadCfg,
+		ForceRefresh:        *forceRefresh,
+	}
+
+	// Opt-in WhatsApp push for green signals. Built only when -wpp-notify is
+	// set so the zero-value LiveConfig.Notifier stays nil (no-op) otherwise.
+	if *wppNotify {
+		cfg.Notifier = &notify.WhatsApp{
+			Endpoint: *wppEndpoint,
+			Phone:    *wppPhone,
+			Client:   &http.Client{Timeout: 10 * time.Second},
+		}
+	}
 
 	if *greensSince > 0 {
 		fmt.Printf("═══ Recent Green Signals — %s %s  (last %s) ═══\n", *symbol, *interval, *greensSince)
@@ -1411,7 +1523,11 @@ func runPaperLive(args []string) int {
 	}
 	if comexCfg.Enabled {
 		fmt.Printf("  COMEX Pinning: ON  pre=%dh  momentum×%.2f  fade×%.2f  expiries=%d\n",
-			comexCfg.PreWindowHours, comexCfg.MomentumMult, comexCfg.FadeMult, len(comexCfg.ExpiryDates))	}
+			comexCfg.PreWindowHours, comexCfg.MomentumMult, comexCfg.FadeMult, len(comexCfg.ExpiryDates))
+	}
+	if *wppNotify {
+		fmt.Printf("  WhatsApp: ON  green ENTRY (|net|≥2.0) → %s via %s\n", *wppPhone, *wppEndpoint)
+	}
 	if *pollSeconds > 0 {
 		fmt.Printf("  Poll cadence: every %ds (fixed)\n", *pollSeconds)
 	} else {
