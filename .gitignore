@@ -1,0 +1,12 @@
+.env
+/go_trading_sweepbos_xauusd
+.claude/
+
+# build artifacts & local data (never commit)
+bin/
+sweepbos.db
+graphify-out/
+
+# python
+__pycache__/
+*.pyc

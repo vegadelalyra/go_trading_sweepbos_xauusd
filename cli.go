@@ -1,0 +1,2000 @@
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"math"
+	"net/http"
+	"os"
+	"os/signal"
+	"sort"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/joho/godotenv"
+
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/bias"
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/capital"
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/core"
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/engine"
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/meta"
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/notify"
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/paper"
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/smc"
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy"
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/strategy/xasset"
+	"github.com/vegadelalyra/go_trading_sweepbos_xauusd/internal/wfa"
+)
+
+// run is the CLI dispatcher invoked from main().
+func run(args []string) int {
+	_ = godotenv.Load()
+	disableColorsIfNotTTY()
+
+	if len(args) < 2 {
+		return runTUI()
+	}
+
+	switch args[1] {
+	case "tui":
+		return runTUI()
+	case "backfill":
+		return runBackfill(args[2:])
+	case "coverage":
+		return runCoverage(args[2:])
+	case "backtest":
+		return runBacktestCLI(args[2:])
+	case "signal":
+		return runSignal(args[2:])
+	case "weights":
+		return runWeights(args[2:])
+	case "wfa":
+		return runWFA(args[2:])
+	case "bootstrap":
+		return runBootstrap(args[2:])
+	case "paper-replay":
+		return runPaperReplay(args[2:])
+	case "paper-live":
+		return runPaperLive(args[2:])
+	case "shadow-stats":
+		return runShadowStats(args[2:])
+	case "capital-sim":
+		return runCapitalSim(args[2:])
+	case "live-signal":
+		return runLiveSignal(args[2:])
+	case "import-cache":
+		return runImportCache(args[2:])
+	case "wpp-send":
+		return runWppSend(args[2:])
+	case "-h", "--help", "help":
+		printUsage()
+		return 0
+	default:
+		fmt.Fprintf(os.Stderr, "unknown subcommand: %q\n\n", args[1])
+		printUsage()
+		return 2
+	}
+}
+
+func printUsage() {
+	fmt.Println(`go_trading_sweepbos_xauusd — XAUUSD smart-money backtester
+
+USAGE
+  go_trading_sweepbos_xauusd [SUBCOMMAND] [FLAGS]
+
+SUBCOMMANDS
+  tui           (default) run the interactive TUI
+  backfill      download historical candles from TwelveData into Postgres
+  coverage      print how many candles we have per (symbol, interval)
+  backtest      run the backtest against cached candles and print bucket stats
+  signal        compose a live signal using strategy weights from a past run
+  weights       print the per-strategy weights derived from a past run
+  wfa           walk-forward analysis: rolling IS→OOS windows
+  bootstrap     stationary block bootstrap CIs over a stored run's trades
+  paper-replay  replay composite signals over historical candles with FIXED weights and persist results
+  paper-live    long-running paper-trader: REST-poll latest candle every interval, signal, grade, persist
+  shadow-stats  aggregate shadow_trades (signals rejected by acceptSignal gates, graded as counter-factuals)
+  capital-sim   simulate a fixed-risk + martingale capital scheme over a stored run's trades, per strategy
+  live-signal   stream live ticks (TD WSS) and recompose the signal on REST polls
+  import-cache  one-shot import of the legacy JSON cache into Postgres
+  wpp-send      send a one-off WhatsApp message via a running go_wpp_bot instance
+
+FLAGS for ` + "`wpp-send`" + `
+  -phone       destination number, country code, no + (default 573137054945)
+  -endpoint    go_wpp_bot send endpoint (default http://127.0.0.1:8080/api/send)
+  -message     message text; if omitted, positional args are joined
+               e.g. sweepbos wpp-send "hola desde la CLI"
+
+FLAGS for ` + "`backfill`" + `
+  -symbol      default XAU/USD
+  -interval    "15m", "1h", "4h", or "all" (runs all three).  Default: all
+  -years       how many years back to fetch.                  Default: 2
+  -pages       safety cap on TD pages per interval.           Default: 50
+
+FLAGS for ` + "`import-cache`" + `
+  -file        path to legacy cache_xauusd_15m.json.          Default: ./cache_xauusd_15m.json
+  -symbol      default XAU/USD
+  -interval    default 15m
+
+ENVIRONMENT
+  TWELVEDATA_API_KEY     required for live, historic, and backfill
+  CANDLES_DSN            Postgres DSN; default:
+                         postgres://emy_admin:emy-1234@127.0.0.1:5432/candles?sslmode=disable`)
+}
+
+func runTUI() int {
+	apiKey := os.Getenv("TWELVEDATA_API_KEY")
+	if apiKey == "" {
+		fmt.Fprintln(os.Stderr, "ERROR: define TWELVEDATA_API_KEY en .env")
+		return 1
+	}
+	ctx := context.Background()
+	pool, err := openPool(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "db: %v\n", err)
+		return 1
+	}
+	defer pool.Close()
+
+	p := tea.NewProgram(newModel(apiKey, pool), tea.WithAltScreen())
+	if _, err := p.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "run: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func runBackfill(args []string) int {
+	fs := flag.NewFlagSet("backfill", flag.ContinueOnError)
+	symbol := fs.String("symbol", "XAU/USD", "symbol to fetch")
+	interval := fs.String("interval", "all", `"15m" | "1h" | "4h" | "all"`)
+	years := fs.Int("years", 2, "years of history to fetch")
+	pages := fs.Int("pages", 50, "max pages per interval (safety cap)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	apiKey := os.Getenv("TWELVEDATA_API_KEY")
+	if apiKey == "" {
+		fmt.Fprintln(os.Stderr, "ERROR: TWELVEDATA_API_KEY is required")
+		return 1
+	}
+
+	intervals := []string{*interval}
+	if *interval == "all" {
+		intervals = []string{"15m", "1h", "4h"}
+	}
+
+	ctx := context.Background()
+	pool, err := openPool(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "db: %v\n", err)
+		return 1
+	}
+	defer pool.Close()
+
+	httpc := &http.Client{Timeout: 60 * time.Second}
+
+	for _, iv := range intervals {
+		cfg := defaultBackfillCfg(*symbol, iv, *years)
+		cfg.MaxPages = *pages
+		fmt.Printf("\n=== backfill %s %s (target: %s) ===\n",
+			*symbol, iv, cfg.TargetStart.Format("2006-01-02"))
+		inserted, err := backfill(ctx, pool, httpc, apiKey, cfg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[%s] error: %v (inserted=%d before error)\n", iv, err, inserted)
+			continue
+		}
+		fmt.Printf("[%s] DONE — inserted %d new candles\n", iv, inserted)
+	}
+	return 0
+}
+
+func runCoverage(args []string) int {
+	fs := flag.NewFlagSet("coverage", flag.ContinueOnError)
+	symbol := fs.String("symbol", "XAU/USD", "symbol")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	ctx := context.Background()
+	pool, err := openPool(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "db: %v\n", err)
+		return 1
+	}
+	defer pool.Close()
+
+	rows, err := coverage(ctx, pool, *symbol)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "query: %v\n", err)
+		return 1
+	}
+	if len(rows) == 0 {
+		fmt.Printf("no candles in DB for %s\n", *symbol)
+		return 0
+	}
+	fmt.Printf("\nCoverage for %s\n", *symbol)
+	fmt.Printf("%-8s  %-8s  %-19s  %-19s  %-7s\n", "interval", "count", "oldest", "newest", "span")
+	fmt.Println(strings.Repeat("-", 70))
+	for _, r := range rows {
+		span := r.Newest.Sub(r.Oldest)
+		days := int(span.Hours() / 24)
+		fmt.Printf("%-8s  %-8d  %-19s  %-19s  %dd\n",
+			r.Interval, r.Count,
+			r.Oldest.Format("2006-01-02 15:04"),
+			r.Newest.Format("2006-01-02 15:04"),
+			days)
+	}
+	fmt.Println()
+	return 0
+}
+
+func runBacktestCLI(args []string) int {
+	fs := flag.NewFlagSet("backtest", flag.ContinueOnError)
+	symbol := fs.String("symbol", "XAU/USD", "symbol")
+	interval := fs.String("interval", "15m", "interval to backtest on")
+	fromStr := fs.String("from", "", "lower bound (YYYY-MM-DD); empty = all history")
+	toStr := fs.String("to", "", "upper bound (YYYY-MM-DD); empty = up to now")
+	persist := fs.Bool("persist", false, "store this run + every trade in backtest_runs/backtest_trades")
+	useBias := fs.Bool("bias", false, "filter signals against H4 EMA200 trend bias")
+	h4Period := fs.Int("h4-period", 200, "EMA period for the H4 bias filter")
+	atrMult := fs.Float64("atr-mult", 0, "if >0, widen SL to max(structural, ATR×mult)")
+	atrPeriod := fs.Int("atr-period", 14, "ATR period when -atr-mult is set")
+	pdLookback := fs.Int("pd-lookback", 0, "Premium/Discount filter lookback in candles (0 disables, 96 = 24h on 15m)")
+	slippage := fs.Float64("slippage", 0, "SL slippage in dollars (0 disables)")
+	slippageNewsMult := fs.Float64("slippage-news-mult", 1.0, "multiplier applied to slippage in news windows")
+	useXAG := fs.Bool("xag", false, "load XAG/USD candles for the XAUXAGPairs strategy")
+	onlyStrategy := fs.String("only-strategy", "", "if set, run the engine with only this strategy (e.g. OrderBlockMit); '' = all registered strategies")
+	skipStrategy := fs.String("skip-strategy", "", "comma-separated list of strategy names to exclude from the registry (e.g. FVGFill,DailyBreakout); '' = none skipped")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	ctx := context.Background()
+	pool, err := openPool(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "db: %v\n", err)
+		return 1
+	}
+	defer pool.Close()
+
+	var from, to time.Time
+	if *fromStr != "" {
+		t, err := time.Parse("2006-01-02", *fromStr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "from: %v\n", err)
+			return 2
+		}
+		from = t
+	}
+	if *toStr != "" {
+		t, err := time.Parse("2006-01-02", *toStr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "to: %v\n", err)
+			return 2
+		}
+		to = t.Add(24 * time.Hour)
+	}
+
+	candles, err := loadCandles(ctx, pool, *symbol, *interval, from, to)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load: %v\n", err)
+		return 1
+	}
+	if len(candles) < 100 {
+		fmt.Fprintf(os.Stderr, "only %d candles loaded — run `backfill` first\n", len(candles))
+		return 1
+	}
+
+	fmt.Printf("Loaded %d candles  range=%s → %s\n",
+		len(candles),
+		candles[0].Time.Format("2006-01-02 15:04"),
+		candles[len(candles)-1].Time.Format("2006-01-02 15:04"))
+
+	params := engine.ParamsFor(*interval)
+	if *useBias {
+		h4, err := loadCandles(ctx, pool, *symbol, "4h", from, to)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load h4: %v\n", err)
+			return 1
+		}
+		if len(h4) < *h4Period+10 {
+			fmt.Fprintf(os.Stderr, "not enough H4 candles (%d) for bias period %d\n", len(h4), *h4Period)
+		} else {
+			params.H4Bias = bias.BuildBiasMap(h4, *h4Period, 4*time.Hour)
+			fmt.Printf("Bias filter ON  (H4 EMA%d, %d bars)\n", *h4Period, len(h4))
+		}
+	}
+	if *atrMult > 0 {
+		params.ATRMult = *atrMult
+		params.ATRPeriod = *atrPeriod
+		fmt.Printf("ATR SL widening ON  (mult=%.2f period=%d)\n", *atrMult, *atrPeriod)
+	}
+	if *pdLookback > 0 {
+		params.PDLookback = *pdLookback
+		fmt.Printf("Premium/Discount filter ON  (lookback=%d candles)\n", *pdLookback)
+	}
+	if *slippage > 0 {
+		params.SlippagePoints = *slippage
+		params.SlippageNewsMult = *slippageNewsMult
+		fmt.Printf("Slippage ON  (base=%.2f × news=%.1f)\n", *slippage, *slippageNewsMult)
+	}
+	if *useXAG {
+		xag, err := loadCandles(ctx, pool, "XAG/USD", "1h", from, to)
+		if err != nil || len(xag) == 0 {
+			fmt.Fprintf(os.Stderr, "XAG data unavailable — XAUXAGPairs will stay inactive\n")
+		} else {
+			xasset.XAUXAGPairsInstance.SetXAG(xag)
+			fmt.Printf("XAG candles loaded (%d 1h bars) — XAUXAGPairs active\n", len(xag))
+		}
+	}
+	strats := strategy.All()
+	if *onlyStrategy != "" {
+		s, ok := strategy.ByName(*onlyStrategy)
+		if !ok {
+			fmt.Fprintf(os.Stderr, "unknown strategy %q\n", *onlyStrategy)
+			return 2
+		}
+		strats = []strategy.Strategy{s}
+		fmt.Printf("Strategy filter ON  (only %s)\n", *onlyStrategy)
+	}
+	if *skipStrategy != "" {
+		skip := map[string]bool{}
+		for _, n := range strings.Split(*skipStrategy, ",") {
+			n = strings.TrimSpace(n)
+			if n == "" {
+				continue
+			}
+			if _, ok := strategy.ByName(n); !ok {
+				fmt.Fprintf(os.Stderr, "unknown strategy in -skip-strategy: %q\n", n)
+				return 2
+			}
+			skip[n] = true
+		}
+		filtered := strats[:0]
+		for _, s := range strats {
+			if skip[s.Meta().Name] {
+				continue
+			}
+			filtered = append(filtered, s)
+		}
+		strats = filtered
+		fmt.Printf("Strategy skip ON  (excluded: %s)\n", *skipStrategy)
+	}
+	result := engine.RunBacktest(candles, strats, params)
+	printBacktestReport(*symbol, *interval, result)
+
+	if *persist {
+		runID, err := saveBacktestRun(ctx, pool, *symbol, *interval, candles, result)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "persist: %v\n", err)
+			return 1
+		}
+		fmt.Printf("\nPersisted as backtest_runs.id=%d with %d trades\n", runID, len(result.Trades))
+	}
+	return 0
+}
+
+// parseTiers parses a comma-separated list of "threshold:risk" pairs into
+// a sorted []capital.Tier for the capital-sim. Pairs are ASC by threshold.
+// Martingale per tier is implicitly 0 (no martingale) since the user
+// configures with -risk-martingale globally; mixing tier-mart and global
+// mart would be ambiguous.
+func parseTiers(s string) ([]capital.Tier, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]capital.Tier, 0, len(parts))
+	for _, p := range parts {
+		fields := strings.Split(strings.TrimSpace(p), ":")
+		if len(fields) != 2 {
+			return nil, fmt.Errorf("invalid tier %q: want \"threshold:risk\"", p)
+		}
+		th, err := strconv.ParseFloat(strings.TrimSpace(fields[0]), 64)
+		if err != nil || th < 0 {
+			return nil, fmt.Errorf("invalid tier threshold %q: non-negative number required", fields[0])
+		}
+		r, err := strconv.ParseFloat(strings.TrimSpace(fields[1]), 64)
+		if err != nil || r <= 0 || r > 1 {
+			return nil, fmt.Errorf("invalid tier risk %q: 0 < r ≤ 1 required", fields[1])
+		}
+		out = append(out, capital.Tier{Threshold: th, FirstRiskPct: r})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Threshold < out[j].Threshold })
+	return out, nil
+}
+
+// parsePaperRunIDs splits a comma-separated string like "3,7,12" into a
+// []int64 of paper_run IDs. Empty input returns (nil, nil). Used by every
+// subcommand that consumes weights so the paper→weights feedback loop is
+// a single flag away.
+func parsePaperRunIDs(s string) ([]int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]int64, 0, len(parts))
+	for _, p := range parts {
+		v, err := strconv.ParseInt(strings.TrimSpace(p), 10, 64)
+		if err != nil || v <= 0 {
+			return nil, fmt.Errorf("invalid paper-run entry %q: positive integer required", p)
+		}
+		out = append(out, v)
+	}
+	return out, nil
+}
+
+// parseHHMM parses an "hh:mm" UTC time-of-day string into (hour, minute).
+// Used by the London Fix CLI flags to populate meta.LondonFixConfig.
+func parseHHMM(s string) (int, int, error) {
+	parts := strings.Split(strings.TrimSpace(s), ":")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid hh:mm %q: want \"HH:MM\"", s)
+	}
+	h, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil || h < 0 || h > 23 {
+		return 0, 0, fmt.Errorf("invalid hour in %q: 0..23 required", s)
+	}
+	m, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil || m < 0 || m > 59 {
+		return 0, 0, fmt.Errorf("invalid minute in %q: 0..59 required", s)
+	}
+	return h, m, nil
+}
+
+// buildLondonFixConfig assembles a meta.LondonFixConfig from the
+// per-subcommand CLI flags. When `enabled` is false the helper still
+// validates the hh:mm strings (so a typo surfaces immediately) but
+// returns a zero-value Enabled=false config — a strict no-op downstream.
+func buildLondonFixConfig(enabled bool, start, end string, momMult, fadeMult float64) (meta.LondonFixConfig, error) {
+	sh, sm, err := parseHHMM(start)
+	if err != nil {
+		return meta.LondonFixConfig{}, fmt.Errorf("-london-fix-start: %w", err)
+	}
+	eh, em, err := parseHHMM(end)
+	if err != nil {
+		return meta.LondonFixConfig{}, fmt.Errorf("-london-fix-end: %w", err)
+	}
+	if momMult < 0 {
+		return meta.LondonFixConfig{}, fmt.Errorf("-london-fix-momentum-mult must be >= 0")
+	}
+	if fadeMult < 0 {
+		return meta.LondonFixConfig{}, fmt.Errorf("-london-fix-fade-mult must be >= 0")
+	}
+	return meta.LondonFixConfig{
+		Enabled:      enabled,
+		StartHour:    sh,
+		StartMin:     sm,
+		EndHour:      eh,
+		EndMin:       em,
+		MomentumMult: momMult,
+		FadeMult:     fadeMult,
+	}, nil
+}
+
+// buildCOMEXPinConfig assembles a meta.COMEXPinConfig from the
+// per-subcommand CLI flags. When `enabled` is false the helper returns a
+// zero-value Enabled=false config — a strict no-op downstream regardless
+// of the other parameters. When `enabled` is true the caller is
+// responsible for populating ExpiryDates via meta.LoadExpiryDates before
+// constructing the composer; this helper only validates the multipliers
+// so a typo surfaces immediately.
+func buildCOMEXPinConfig(enabled bool, preHours int, momMult, fadeMult float64) (meta.COMEXPinConfig, error) {
+	if preHours <= 0 {
+		return meta.COMEXPinConfig{}, fmt.Errorf("-comex-pre-hours must be > 0")
+	}
+	if momMult < 0 {
+		return meta.COMEXPinConfig{}, fmt.Errorf("-comex-momentum-mult must be >= 0")
+	}
+	if fadeMult < 0 {
+		return meta.COMEXPinConfig{}, fmt.Errorf("-comex-fade-mult must be >= 0")
+	}
+	return meta.COMEXPinConfig{
+		Enabled:        enabled,
+		PreWindowHours: preHours,
+		MomentumMult:   momMult,
+		FadeMult:       fadeMult,
+	}, nil
+}
+
+// buildDXYFilterConfig assembles a meta.DXYFilterConfig from the
+// per-subcommand CLI flags. When `enabled` is false the helper returns
+// the zero-value (no-op). When true it loads DXYCandles from the ohlc
+// table at the same interval as the XAU run.
+func buildDXYFilterConfig(ctx context.Context, pool *pgxpool.Pool, enabled bool, symbol, interval string, lookback int, confluentMult, opposingMult float64) (meta.DXYFilterConfig, error) {
+	if !enabled {
+		return meta.DXYFilterConfig{}, nil
+	}
+	if lookback <= 0 {
+		return meta.DXYFilterConfig{}, fmt.Errorf("-dxy-lookback must be > 0")
+	}
+	if confluentMult < 0 || opposingMult < 0 {
+		return meta.DXYFilterConfig{}, fmt.Errorf("-dxy-confluent-mult / -dxy-opposing-mult must be >= 0")
+	}
+	candles, err := loadCandles(ctx, pool, symbol, interval, time.Time{}, time.Time{})
+	if err != nil {
+		return meta.DXYFilterConfig{}, fmt.Errorf("load DXY candles (%s %s): %w", symbol, interval, err)
+	}
+	if len(candles) == 0 {
+		return meta.DXYFilterConfig{}, fmt.Errorf("DXY backfill is empty for %s %s — run `backfill -symbol=%s -interval=%s` first", symbol, interval, symbol, interval)
+	}
+	fmt.Printf("DXY filter ON  proxy=%s interval=%s candles=%d range=%s→%s  lookback=%d  confluent×%.2f  opposing×%.2f\n",
+		symbol, interval, len(candles),
+		candles[0].Time.Format("2006-01-02"),
+		candles[len(candles)-1].Time.Format("2006-01-02"),
+		lookback, confluentMult, opposingMult)
+	return meta.DXYFilterConfig{
+		Enabled:       true,
+		LookbackBars:  lookback,
+		ConfluentMult: confluentMult,
+		OpposingMult:  opposingMult,
+		DXYCandles:    candles,
+	}, nil
+}
+
+func runWeights(args []string) int {
+	fs := flag.NewFlagSet("weights", flag.ContinueOnError)
+	runID := fs.Int64("run-id", 0, "backtest_runs.id to source weights from (0 = latest)")
+	paperRun := fs.String("paper-run", "", "comma-separated paper_runs.id list to UNION into the weight calc (e.g. \"2,3\")")
+	liveFeedback := fs.Bool("live-feedback", false, "Tema 2: shrink the canonical weights toward the clean live paper-trade estimate (read-only inspection of the blend); ignores -paper-run")
+	symbol := fs.String("symbol", "XAU/USD", "symbol for -live-feedback live-trade source")
+	interval := fs.String("interval", "5m", "interval for -live-feedback live-trade source")
+	lfK := fs.Float64("live-feedback-k", meta.DefaultLiveFeedbackK, "shrinkage constant K (λ=n/(n+K)) for -live-feedback")
+	lfFloor := fs.Int("live-feedback-floor", meta.DefaultLiveFeedbackFloor, "per-strategy live-trade floor for -live-feedback")
+	lfSince := fs.String("live-feedback-since", "2026-06-09", "ignore live trades before this date (YYYY-MM-DD) for -live-feedback (default = first clean UTC day post dedup-fix)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	paperRunIDs, err := parsePaperRunIDs(*paperRun)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+
+	ctx := context.Background()
+	pool, err := openPool(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "db: %v\n", err)
+		return 1
+	}
+	defer pool.Close()
+
+	id := *runID
+	if id == 0 {
+		err = pool.QueryRow(ctx, `SELECT id FROM backtest_runs ORDER BY id DESC LIMIT 1`).Scan(&id)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "find latest run: %v\n", err)
+			return 1
+		}
+	}
+	var ws []meta.StrategyWeight
+	srcNote := fmt.Sprintf("backtest_runs.id=%d", id)
+	if *liveFeedback {
+		since, perr := time.Parse("2006-01-02", *lfSince)
+		if perr != nil {
+			fmt.Fprintf(os.Stderr, "live-feedback-since: %v\n", perr)
+			return 2
+		}
+		ws, err = meta.LoadWeightsBlended(ctx, pool, id, meta.LiveFeedbackConfig{
+			Enabled: true, Symbol: *symbol, Interval: *interval,
+			Since: since.UTC(), K: *lfK, Floor: *lfFloor,
+		})
+		srcNote += fmt.Sprintf(" + live feedback (%s %s, K=%.0f, floor=%d, since=%s)",
+			*symbol, *interval, *lfK, *lfFloor, *lfSince)
+	} else {
+		ws, err = meta.LoadWeights(ctx, pool, id, paperRunIDs...)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load weights: %v\n", err)
+		return 1
+	}
+	fmt.Printf("\nWeights derived from %s\n\n", srcNote)
+	fmt.Println(meta.FormatWeights(ws))
+	return 0
+}
+
+func runSignal(args []string) int {
+	fs := flag.NewFlagSet("signal", flag.ContinueOnError)
+	runID := fs.Int64("run-id", 0, "backtest_runs.id to source weights (0 = latest)")
+	paperRun := fs.String("paper-run", "", "comma-separated paper_runs.id list to UNION into the weight calc")
+	symbol := fs.String("symbol", "XAU/USD", "symbol")
+	interval := fs.String("interval", "15m", "interval to evaluate")
+	threshold := fs.Float64("threshold", 2.0, "min |net weight| required to recommend (ignored when -threshold-percentile > 0)")
+	thresholdPct := fs.Float64("threshold-percentile", 0, "if > 0, gate by the upper-tail percentile of the rolling |NetWeight| distribution; mutually exclusive with -threshold")
+	capital := fs.Float64("capital", 0, "USD to risk; if >0, compute Admirals units & margin")
+	scanBack := fs.Int("scan-back", 0, "also scan the last N candles for any recommended signals")
+	bySession := fs.Bool("by-session", false, "use per-session weights instead of the global table")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *thresholdPct < 0 || *thresholdPct > 1 {
+		fmt.Fprintln(os.Stderr, "-threshold-percentile must be in [0, 1]")
+		return 2
+	}
+	paperRunIDs, err := parsePaperRunIDs(*paperRun)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+
+	ctx := context.Background()
+	pool, err := openPool(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "db: %v\n", err)
+		return 1
+	}
+	defer pool.Close()
+
+	id := *runID
+	if id == 0 {
+		err = pool.QueryRow(ctx, `SELECT id FROM backtest_runs ORDER BY id DESC LIMIT 1`).Scan(&id)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "find latest run: %v\n", err)
+			return 1
+		}
+	}
+	candles, err := loadCandles(ctx, pool, *symbol, *interval, time.Time{}, time.Time{})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load candles: %v\n", err)
+		return 1
+	}
+	if len(candles) < 200 {
+		fmt.Fprintf(os.Stderr, "not enough candles (%d) — run backfill first\n", len(candles))
+		return 1
+	}
+	a := smc.Analyze(candles)
+
+	// Two compose modes share the rest of the runSignal loop. compose is
+	// closed over either weights map so the call site stays uniform.
+	// Dynamic-percentile mode keeps a single buffer alive through the
+	// warm-up loop and the scan, so the threshold reflects the rolling
+	// distribution observed in the loaded history.
+	var buf *meta.ThresholdBuffer
+	if *thresholdPct > 0 {
+		buf = meta.NewThresholdBuffer(meta.DefaultThresholdBufferCap)
+	}
+	var compose func(i int) meta.CompositeSignal
+	if *bySession {
+		ws, err := meta.LoadWeightsBySession(ctx, pool, id, paperRunIDs...)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load weights-by-session: %v\n", err)
+			return 1
+		}
+		if buf != nil {
+			compose = func(i int) meta.CompositeSignal {
+				return meta.ComposeSignalBySessionDynamic(candles, a, i, ws, *thresholdPct, buf, meta.LondonFixConfig{}, meta.COMEXPinConfig{}, nil)
+			}
+		} else {
+			compose = func(i int) meta.CompositeSignal {
+				return meta.ComposeSignalBySession(candles, a, i, ws, *threshold, meta.LondonFixConfig{}, meta.COMEXPinConfig{}, nil)
+			}
+		}
+	} else {
+		ws, err := meta.LoadWeights(ctx, pool, id, paperRunIDs...)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load weights: %v\n", err)
+			return 1
+		}
+		weights := meta.WeightMap(ws)
+		if buf != nil {
+			compose = func(i int) meta.CompositeSignal {
+				return meta.ComposeSignalDynamic(candles, a, i, weights, *thresholdPct, buf, meta.LondonFixConfig{}, meta.COMEXPinConfig{}, nil)
+			}
+		} else {
+			compose = func(i int) meta.CompositeSignal {
+				return meta.ComposeSignal(candles, a, i, weights, *threshold, meta.LondonFixConfig{}, meta.COMEXPinConfig{}, nil)
+			}
+		}
+	}
+
+	// Warm the percentile buffer with the rolling window before evaluating
+	// the current candle. Without this the first call would see an empty
+	// distribution and always trigger. The warm-up window is the buffer
+	// capacity (DefaultThresholdBufferCap ≈ 1 week of 5m); recently-pruned
+	// candles fall out naturally as the ring buffer wraps.
+	if buf != nil {
+		warmStart := len(candles) - 1 - meta.DefaultThresholdBufferCap
+		warmStart = max(warmStart, 0)
+		for i := warmStart; i < len(candles)-1; i++ {
+			compose(i)
+		}
+	}
+
+	// Always report the current candle.
+	cs := compose(len(candles) - 1)
+	displayThreshold := *threshold
+	if buf != nil {
+		displayThreshold = buf.Percentile(*thresholdPct)
+	}
+	meta.PrintCompositeSignal(*symbol, *interval, candles[len(candles)-1], cs, id, displayThreshold, *capital)
+
+	// Optional: walk back N candles looking for the most recent
+	// recommended (threshold-crossing) signal — useful when "now" is quiet.
+	if *scanBack > 0 {
+		fmt.Printf("\n── Scanning back %d candles for recommended signals ──\n", *scanBack)
+		found := 0
+		start := len(candles) - 1 - *scanBack
+		if start < 0 {
+			start = 0
+		}
+		for k := len(candles) - 1; k >= start; k-- {
+			c := compose(k)
+			if !c.Recommended {
+				continue
+			}
+			found++
+			fmt.Printf("  %s  %-5s  entry=%.2f  SL=%.2f  TP=%.2f  net=%+5.2f  conf=%.0f%%\n",
+				candles[k].Time.Format("2006-01-02 15:04"),
+				c.Side.String(), c.BestEntry, c.BestSL, c.BestTP, c.NetWeight, c.Confidence*100)
+			if found >= 10 {
+				fmt.Println("  …(stopping at 10)")
+				break
+			}
+		}
+		if found == 0 {
+			fmt.Println("  No recommended signals in scan window.")
+		}
+	}
+	return 0
+}
+
+func runWFA(args []string) int {
+	fs := flag.NewFlagSet("wfa", flag.ContinueOnError)
+	symbol := fs.String("symbol", "XAU/USD", "symbol")
+	interval := fs.String("interval", "15m", "interval")
+	is := fs.Int("is-months", 6, "in-sample window months")
+	oos := fs.Int("oos-months", 2, "out-of-sample window months")
+	step := fs.Int("step-months", 2, "rolling step in months")
+	threshold := fs.Float64("threshold", 2.0, "composite |NetWeight| threshold for OOS (ignored when -threshold-percentile > 0)")
+	thresholdPct := fs.Float64("threshold-percentile", 0, "if > 0, gate by the upper-tail percentile (e.g. 0.95) of the per-window |NetWeight| distribution; mutually exclusive with -threshold")
+	useBias := fs.Bool("bias", true, "apply H4 EMA bias filter inside each window")
+	atrMult := fs.Float64("atr-mult", 1.5, "ATR SL widening multiplier (0 disables)")
+	h4Period := fs.Int("h4-period", 200, "EMA period for the H4 bias")
+	pdLookback := fs.Int("pd-lookback", 0, "Premium/Discount filter lookback in candles (0 disables)")
+	slippage := fs.Float64("slippage", 0, "SL slippage in dollars (0 disables)")
+	slippageNewsMult := fs.Float64("slippage-news-mult", 1.0, "multiplier applied to slippage in news windows")
+	tripleBarrier := fs.Bool("triple-barrier", false, "enable triple-barrier exit (partial-TP @ +PartialR, breakeven on remainder, dynamic time-stop)")
+	tbPartialR := fs.Float64("tb-partial-r", 1.5, "triple-barrier: R-multiple at which the partial leg fires")
+	tbTimeStopCandles := fs.Int("tb-time-stop-candles", 8, "triple-barrier: bars after which the dynamic time-stop becomes eligible")
+	tbTimeStopRangeR := fs.Float64("tb-time-stop-r", 0.3, "triple-barrier: |R| band that classifies the position as stagnating")
+	bayesShrink := fs.Bool("bayes-shrink", false, "Bayesian shrinkage of per-strategy RR fitted on IS, applied to OOS (Phase 2.1)")
+	londonFix := fs.Bool("london-fix", false, "apply the London Gold Fix session adjustment (Phase 3.1): momentum ×0.3 / fade ×1.5 inside the window")
+	londonFixStart := fs.String("london-fix-start", "14:40", "UTC start of the London Fix window (HH:MM)")
+	londonFixEnd := fs.String("london-fix-end", "15:20", "UTC end of the London Fix window (HH:MM)")
+	londonFixMomMult := fs.Float64("london-fix-momentum-mult", 0.3, "weight multiplier for momentum strategies inside the window (0 silences them)")
+	londonFixFadeMult := fs.Float64("london-fix-fade-mult", 1.5, "weight multiplier for liquidity-fade strategies inside the window (1.0 = neutral)")
+	comexPin := fs.Bool("comex-pinning", false, "apply the COMEX expiry pinning filter (Phase 3.2): momentum ×0.0 / mean-reversion ×1.3 inside the 48h pre-expiry window")
+	comexPreHours := fs.Int("comex-pre-hours", 48, "hours BEFORE each seeded GC expiry that the pinning regime kicks in")
+	comexMomMult := fs.Float64("comex-momentum-mult", 0.0, "weight multiplier for momentum strategies inside the COMEX pre-expiry window (0 silences them)")
+	comexFadeMult := fs.Float64("comex-fade-mult", 1.3, "weight multiplier for mean-reversion strategies inside the COMEX pre-expiry window (1.0 = neutral)")
+	dynamicSpread := fs.Bool("dynamic-spread", false, "use the synthetic intraday spread curve (Phase 4.1) instead of the constant SpreadDollar")
+	spreadBase := fs.Float64("spread-base", 0.32, "base spread in USD when -dynamic-spread is enabled (Admirals XAU Zero MT5 typical)")
+	spreadRollMult := fs.Float64("spread-rollover-mult", 3.0, "spread multiplier during the 17:00 NY daily rollover hour")
+	spreadNewsMult := fs.Float64("spread-news-mult", 2.0, "spread multiplier during NY news hours (08, 09, 10, 14)")
+	spreadFilter := fs.Bool("spread-filter", false, "reject signals when modelled spread spikes above -spread-filter-mult × SMA (Phase 4.2 stub)")
+	spreadFilterMult := fs.Float64("spread-filter-mult", 1.5, "ratio of current spread to trailing-SMA above which the filter rejects (>= 1.0)")
+	skipStrategy := fs.String("skip-strategy", "", "comma-separated list of strategy names to silence in the composer (weight forced to 0); '' = legacy")
+	capStrategy := fs.String("cap-strategy", "", "comma-separated \"name:mult\" pairs to scale a strategy's composer weight (e.g. FVGFill:0.7); '' = legacy")
+	persist := fs.Bool("persist", false, "store this WFA run + every OOS trade in wfa_runs/wfa_trades")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *thresholdPct < 0 || *thresholdPct > 1 {
+		fmt.Fprintln(os.Stderr, "-threshold-percentile must be in [0, 1]")
+		return 2
+	}
+	lfCfg, err := buildLondonFixConfig(*londonFix, *londonFixStart, *londonFixEnd, *londonFixMomMult, *londonFixFadeMult)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	comexCfg, err := buildCOMEXPinConfig(*comexPin, *comexPreHours, *comexMomMult, *comexFadeMult)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	spreadCfg := engine.SpreadCurveConfig{
+		Enabled:       *dynamicSpread,
+		Base:          *spreadBase,
+		RolloverMult:  *spreadRollMult,
+		NewsMult:      *spreadNewsMult,
+		FilterEnabled: *spreadFilter,
+		FilterMult:    *spreadFilterMult,
+		FilterSMABars: 6,
+	}
+
+	ctx := context.Background()
+	pool, err := openPool(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "db: %v\n", err)
+		return 1
+	}
+	defer pool.Close()
+
+	// Populate the expiry-date list from the comex_expiry table only when
+	// the overlay is actually enabled. A miswire (table missing, empty,
+	// permissions) surfaces immediately rather than silently degrading to
+	// "Enabled=true but no dates" which would behave as a no-op.
+	if comexCfg.Enabled {
+		dates, err := meta.LoadExpiryDates(ctx, pool)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load comex_expiry: %v\n", err)
+			return 1
+		}
+		if len(dates) == 0 {
+			fmt.Fprintln(os.Stderr, "comex_expiry is empty — apply schema/005_comex_expiry.sql first")
+			return 1
+		}
+		comexCfg.ExpiryDates = dates
+	}
+
+	cfg := wfa.WFAConfig{
+		Symbol: *symbol, Interval: *interval,
+		ISWindowMonths: *is, OOSWindowMonths: *oos, StepMonths: *step,
+		Threshold:           *threshold,
+		ThresholdPercentile: *thresholdPct,
+		UseBias:             *useBias,
+		ATRMult:             *atrMult,
+		H4Period:            *h4Period,
+		PDLookback:          *pdLookback,
+		Slippage:            *slippage,
+		SlippageNewsMult:    *slippageNewsMult,
+		TripleBarrier: engine.TripleBarrierConfig{
+			Enabled:         *tripleBarrier,
+			PartialR:        *tbPartialR,
+			TimeStopCandles: *tbTimeStopCandles,
+			TimeStopRangeR:  *tbTimeStopRangeR,
+		},
+		BayesShrink: *bayesShrink,
+		LondonFix:   lfCfg,
+		COMEXPin:    comexCfg,
+		SpreadCurve: spreadCfg,
+	}
+	if *skipStrategy != "" {
+		skip := map[string]bool{}
+		for _, n := range strings.Split(*skipStrategy, ",") {
+			n = strings.TrimSpace(n)
+			if n == "" {
+				continue
+			}
+			if _, ok := strategy.ByName(n); !ok {
+				fmt.Fprintf(os.Stderr, "unknown strategy in -skip-strategy: %q\n", n)
+				return 2
+			}
+			skip[n] = true
+		}
+		cfg.SkipStrategies = skip
+		fmt.Printf("WFA skip-strategy ON  (silenced: %s)\n", *skipStrategy)
+	}
+	if *capStrategy != "" {
+		caps := map[string]float64{}
+		for _, pair := range strings.Split(*capStrategy, ",") {
+			pair = strings.TrimSpace(pair)
+			if pair == "" {
+				continue
+			}
+			parts := strings.SplitN(pair, ":", 2)
+			if len(parts) != 2 {
+				fmt.Fprintf(os.Stderr, "invalid -cap-strategy entry %q (expected name:mult)\n", pair)
+				return 2
+			}
+			name := strings.TrimSpace(parts[0])
+			if _, ok := strategy.ByName(name); !ok {
+				fmt.Fprintf(os.Stderr, "unknown strategy in -cap-strategy: %q\n", name)
+				return 2
+			}
+			mult, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+			if err != nil || mult < 0 {
+				fmt.Fprintf(os.Stderr, "invalid multiplier in -cap-strategy %q: %v\n", pair, err)
+				return 2
+			}
+			caps[name] = mult
+		}
+		cfg.CapStrategies = caps
+		fmt.Printf("WFA cap-strategy ON  (%s)\n", *capStrategy)
+	}
+	candles, err := loadCandles(ctx, pool, cfg.Symbol, cfg.Interval, cfg.StartDate, cfg.EndDate)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load candles: %v\n", err)
+		return 1
+	}
+	var h4Candles []core.Candle
+	if cfg.UseBias {
+		h4Candles, err = loadCandles(ctx, pool, cfg.Symbol, "4h", cfg.StartDate, cfg.EndDate)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load h4: %v\n", err)
+			return 1
+		}
+	}
+	res, err := wfa.RunWFA(cfg, candles, h4Candles)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "wfa: %v\n", err)
+		return 1
+	}
+
+	fmt.Printf("\n═══ Walk-Forward Analysis — %s %s ═══\n", *symbol, *interval)
+	gate := fmt.Sprintf("threshold=%.2f", *threshold)
+	if *thresholdPct > 0 {
+		gate = fmt.Sprintf("threshold-percentile=%.2f", *thresholdPct)
+	}
+	fmt.Printf("  IS=%dmo  OOS=%dmo  step=%dmo  %s  bias=%t  atrMult=%.2f\n",
+		*is, *oos, *step, gate, *useBias, *atrMult)
+	if lfCfg.Enabled {
+		fmt.Printf("  London Fix: ON  window=%02d:%02d-%02d:%02d UTC  momentum×%.2f  fade×%.2f\n",
+			lfCfg.StartHour, lfCfg.StartMin, lfCfg.EndHour, lfCfg.EndMin, lfCfg.MomentumMult, lfCfg.FadeMult)
+	}
+	if comexCfg.Enabled {
+		fmt.Printf("  COMEX Pinning: ON  pre=%dh  momentum×%.2f  fade×%.2f  expiries=%d\n",
+			comexCfg.PreWindowHours, comexCfg.MomentumMult, comexCfg.FadeMult, len(comexCfg.ExpiryDates))
+	}
+	fmt.Println()
+	fmt.Printf("  %-3s  %-19s  %-19s  %-5s  %-7s  %-7s  %-7s\n",
+		"#", "OOS Start", "OOS End", "N", "WR%", "NetR", "Sharpe")
+	for i, w := range res.Windows {
+		fmt.Printf("  %-3d  %-19s  %-19s  %-5d  %6.1f  %+7.2f  %+7.2f\n",
+			i+1,
+			w.OOSStart.Format("2006-01-02 15:04"),
+			w.OOSEnd.Format("2006-01-02 15:04"),
+			len(w.OOSTrades), w.OOSWinRate*100, w.OOSNetR, w.OOSSharpe)
+	}
+
+	fmt.Printf("\n── Combined OOS curve (concatenated) ────────────────────────\n")
+	if res.WindowsCount == 0 || len(res.CombinedTrades) == 0 {
+		fmt.Println("  No OOS trades — widen the window, lower the threshold, or check data coverage.")
+		return 0
+	}
+	s := res.CombinedStats
+	pf := fmt.Sprintf("%.2f", s.ProfitFactor)
+	if math.IsInf(s.ProfitFactor, 1) {
+		pf = "∞"
+	}
+	fmt.Printf("  Trades=%d  WR=%.1f%%  NetR=%+.2f  PF=%s  MaxDD=%.1f%%  Sharpe=%.2f  Calmar=%.2f\n",
+		s.Total, s.WinRate*100, s.NetR, pf, s.MaxDDPct*100, s.Sharpe, s.Calmar)
+	fmt.Printf("  Balance: $%.0f → $%.0f (%+.2f%%)\n",
+		s.StartBalance, s.EndBalance, (s.EndBalance-s.StartBalance)/s.StartBalance*100)
+
+	if *persist {
+		runID, err := wfa.SaveWFARun(ctx, pool, cfg, res)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "persist: %v\n", err)
+			return 1
+		}
+		fmt.Printf("\nPersisted as wfa_runs.id=%d with %d trades\n", runID, len(res.CombinedTrades))
+	}
+	return 0
+}
+
+func runBootstrap(args []string) int {
+	fs := flag.NewFlagSet("bootstrap", flag.ContinueOnError)
+	runID := fs.Int64("run-id", 0, "backtest_runs.id to bootstrap (0 = latest plain run, mutually exclusive with -wfa-run)")
+	wfaRunID := fs.Int64("wfa-run", 0, "wfa_runs.id to bootstrap (operates on the concatenated OOS curve)")
+	iterations := fs.Int("iterations", 5000, "bootstrap iterations (≥5000 recommended for stable tails)")
+	blockLen := fs.Float64("block", 40, "expected block length in trades (geometric distribution); ignored when -block-grid is set")
+	blockGrid := fs.String("block-grid", "", "comma-separated block lengths (e.g. \"10,20,40,60\") — prints CI sensitivity to the geometric block parameter")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *runID != 0 && *wfaRunID != 0 {
+		fmt.Fprintln(os.Stderr, "-run-id and -wfa-run are mutually exclusive")
+		return 2
+	}
+	var grid []float64
+	if *blockGrid != "" {
+		for _, s := range strings.Split(*blockGrid, ",") {
+			v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+			if err != nil || v <= 0 {
+				fmt.Fprintf(os.Stderr, "invalid -block-grid entry %q: positive number required\n", s)
+				return 2
+			}
+			grid = append(grid, v)
+		}
+	}
+
+	ctx := context.Background()
+	pool, err := openPool(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "db: %v\n", err)
+		return 1
+	}
+	defer pool.Close()
+
+	var (
+		trades []core.Trade
+		header string
+	)
+	if *wfaRunID != 0 {
+		trades, err = loadWFATrades(ctx, pool, *wfaRunID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load wfa trades: %v\n", err)
+			return 1
+		}
+		header = fmt.Sprintf("Bootstrap — wfa_runs.id=%d (OOS curve)", *wfaRunID)
+	} else {
+		id := *runID
+		if id == 0 {
+			if err := pool.QueryRow(ctx, `SELECT id FROM backtest_runs ORDER BY id DESC LIMIT 1`).Scan(&id); err != nil {
+				fmt.Fprintf(os.Stderr, "find latest run: %v\n", err)
+				return 1
+			}
+		}
+		trades, err = loadBacktestTrades(ctx, pool, id)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load trades: %v\n", err)
+			return 1
+		}
+		header = fmt.Sprintf("Bootstrap — backtest_runs.id=%d", id)
+	}
+	if len(trades) < 30 {
+		fmt.Fprintf(os.Stderr, "only %d trades available — need at least 30 for the bootstrap to be meaningful\n", len(trades))
+		return 1
+	}
+
+	startBal := engine.DefaultParams().StartBalance
+	riskPct := engine.DefaultParams().RiskPct
+	if len(grid) > 0 {
+		fmt.Printf("\n═══ %s — block-grid sweep (%d iterations each, N=%d) ═══\n",
+			header, *iterations, len(trades))
+		fmt.Printf("  %-6s  %-22s  %-22s  %-22s  %-22s\n",
+			"block", "Sharpe (mean, 95% CI)", "MaxDD (mean, 95% CI)", "Calmar (mean, 95% CI)", "NetR (mean, 95% CI)")
+		for _, b := range grid {
+			br := StationaryBlockBootstrap(trades, *iterations, b, startBal, riskPct)
+			fmt.Printf("  %-6.0f  %+5.2f [%+5.2f,%+5.2f]   %4.1f%% [%4.1f%%,%4.1f%%]    %+5.2f [%+5.2f,%+5.2f]   %+6.2f [%+6.2f,%+6.2f]\n",
+				b,
+				br.SharpeMean, br.SharpeLow95, br.SharpeHigh95,
+				br.MaxDDMean*100, br.MaxDDLow95*100, br.MaxDDHigh95*100,
+				br.CalmarMean, br.CalmarLow95, br.CalmarHigh95,
+				br.NetRMean, br.NetRLow95, br.NetRHigh95,
+			)
+		}
+		return 0
+	}
+
+	br := StationaryBlockBootstrap(trades, *iterations, *blockLen, startBal, riskPct)
+	fmt.Printf("\n═══ %s ═══\n", header)
+	fmt.Print(formatBootstrap(br, len(trades)))
+	return 0
+}
+
+func runPaperReplay(args []string) int {
+	fs := flag.NewFlagSet("paper-replay", flag.ContinueOnError)
+	runID := fs.Int64("run-id", 0, "backtest_runs.id whose weights drive the replay (0 = latest)")
+	paperRun := fs.String("paper-run", "", "comma-separated paper_runs.id list to UNION into the weight calc (iterative paper→paper loop)")
+	symbol := fs.String("symbol", "XAU/USD", "symbol")
+	interval := fs.String("interval", "15m", "interval to replay")
+	fromStr := fs.String("from", "", "lower bound (YYYY-MM-DD); empty = full history")
+	toStr := fs.String("to", "", "upper bound (YYYY-MM-DD); empty = up to now")
+	threshold := fs.Float64("threshold", 2.0, "composite |NetWeight| threshold for an entry (ignored when -threshold-percentile > 0)")
+	thresholdPct := fs.Float64("threshold-percentile", 0, "if > 0, gate by the upper-tail percentile of the rolling |NetWeight| distribution; mutually exclusive with -threshold")
+	useBias := fs.Bool("bias", false, "apply H4 EMA bias filter")
+	atrMult := fs.Float64("atr-mult", 0, "ATR SL widening multiplier (0 disables)")
+	h4Period := fs.Int("h4-period", 200, "EMA period for the H4 bias")
+	pdLookback := fs.Int("pd-lookback", 96, "Premium/Discount filter lookback in candles (0 disables, 96 = 24h on 15m)")
+	slippage := fs.Float64("slippage", 0, "SL slippage in dollars (0 disables)")
+	slippageNewsMult := fs.Float64("slippage-news-mult", 1.0, "multiplier applied to slippage in news windows")
+	bySession := fs.Bool("by-session", false, "use per-session weight table instead of the global one")
+	persist := fs.Bool("persist", false, "store this paper run + every trade in paper_runs/paper_trades")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *thresholdPct < 0 || *thresholdPct > 1 {
+		fmt.Fprintln(os.Stderr, "-threshold-percentile must be in [0, 1]")
+		return 2
+	}
+	paperRunIDs, err := parsePaperRunIDs(*paperRun)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+
+	ctx := context.Background()
+	pool, err := openPool(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "db: %v\n", err)
+		return 1
+	}
+	defer pool.Close()
+
+	id := *runID
+	if id == 0 {
+		if err := pool.QueryRow(ctx, `SELECT id FROM backtest_runs ORDER BY id DESC LIMIT 1`).Scan(&id); err != nil {
+			fmt.Fprintf(os.Stderr, "find latest backtest run: %v\n", err)
+			return 1
+		}
+	}
+
+	var from, to time.Time
+	if *fromStr != "" {
+		t, err := time.Parse("2006-01-02", *fromStr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "from: %v\n", err)
+			return 2
+		}
+		from = t
+	}
+	if *toStr != "" {
+		t, err := time.Parse("2006-01-02", *toStr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "to: %v\n", err)
+			return 2
+		}
+		to = t.Add(24 * time.Hour)
+	}
+
+	candles, err := loadCandles(ctx, pool, *symbol, *interval, from, to)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load candles: %v\n", err)
+		return 1
+	}
+	if len(candles) < 200 {
+		fmt.Fprintf(os.Stderr, "only %d candles loaded — widen the range or backfill\n", len(candles))
+		return 1
+	}
+	var h4Candles []core.Candle
+	if *useBias {
+		h4Candles, err = loadCandles(ctx, pool, *symbol, "4h", from, to)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load h4: %v\n", err)
+			return 1
+		}
+	}
+
+	cfg := paper.Config{
+		SourceRunID: id, BySession: *bySession,
+		Symbol: *symbol, Interval: *interval,
+		StartDate:           from,
+		EndDate:             to,
+		Threshold:           *threshold,
+		ThresholdPercentile: *thresholdPct,
+		UseBias:             *useBias,
+		ATRMult:             *atrMult,
+		H4Period:            *h4Period,
+		PDLookback:          *pdLookback,
+		Slippage:            *slippage,
+		SlippageNewsMult:    *slippageNewsMult,
+	}
+
+	var (
+		flat      map[string]float64
+		bySessTbl map[string]map[string]float64
+	)
+	if *bySession {
+		bySessTbl, err = meta.LoadWeightsBySession(ctx, pool, id, paperRunIDs...)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load weights-by-session: %v\n", err)
+			return 1
+		}
+	} else {
+		ws, err := meta.LoadWeights(ctx, pool, id, paperRunIDs...)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load weights: %v\n", err)
+			return 1
+		}
+		flat = meta.WeightMap(ws)
+	}
+
+	res := paper.Replay(cfg, candles, h4Candles, flat, bySessTbl)
+
+	fmt.Printf("\n═══ Paper Replay — %s %s ═══\n", *symbol, *interval)
+	gate := fmt.Sprintf("threshold=%.2f", *threshold)
+	if *thresholdPct > 0 {
+		gate = fmt.Sprintf("threshold-percentile=%.2f", *thresholdPct)
+	}
+	fmt.Printf("  Source: backtest_runs.id=%d  ·  bySession=%t  ·  %s  ·  bias=%t  ·  atrMult=%.2f\n",
+		id, *bySession, gate, *useBias, *atrMult)
+	fmt.Printf("  Range: %s → %s  (%d candles)\n\n",
+		candles[0].Time.Format("2006-01-02 15:04"),
+		candles[len(candles)-1].Time.Format("2006-01-02 15:04"),
+		len(candles))
+	s := res.Stats
+	if s.Total == 0 {
+		fmt.Println("  No trades — threshold too high, weights too sparse, or filters blocked everything.")
+		return 0
+	}
+	pf := fmt.Sprintf("%.2f", s.ProfitFactor)
+	if math.IsInf(s.ProfitFactor, 1) {
+		pf = "∞"
+	}
+	fmt.Printf("  Trades=%d  WR=%.1f%%  NetR=%+.2f  PF=%s  MaxDD=%.1f%%  Sharpe=%.2f  Calmar=%.2f\n",
+		s.Total, s.WinRate*100, s.NetR, pf, s.MaxDDPct*100, s.Sharpe, s.Calmar)
+	fmt.Printf("  Balance: $%.0f → $%.0f (%+.2f%%)\n",
+		s.StartBalance, s.EndBalance, (s.EndBalance-s.StartBalance)/s.StartBalance*100)
+
+	// Per-strategy breakdown of who actually got credit — the attribution
+	// to the WinnerStrategy lets us see which strategies are pulling weight
+	// in the live regime, which is the input the weight-feedback step
+	// (commit 2) will consume.
+	fmt.Println("\n── Per Winner Strategy ─────────────────────────────────────")
+	for _, name := range sortedKeys(s.PerStrategy) {
+		ps := s.PerStrategy[name]
+		fmt.Printf("  %-18s  Trades=%d  Win=%d/Loss=%d  WR=%5.1f%%  NetR=%+7.2f\n",
+			name, ps.Total, ps.Wins, ps.Losses, ps.WinRate*100, ps.NetR)
+	}
+
+	if *persist {
+		paperID, err := paper.SaveRun(ctx, pool, cfg,
+			res, candles[0].Time, candles[len(candles)-1].Time)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "persist: %v\n", err)
+			return 1
+		}
+		fmt.Printf("\nPersisted as paper_runs.id=%d with %d trades\n", paperID, len(res.Trades))
+	}
+	return 0
+}
+
+// stdoutLogger satisfies paper.Logger by printing to stdout with a clock
+// stamp. The paper-live loop calls Log(...) for every interesting moment
+// (sleep, fetch, signal, grade) so users can tail the script and see the
+// system reasoning in real time. Errors are NOT printed via Log — they
+// stay on stderr.
+//
+// Output is enriched with ANSI colors and an extra blank line before each
+// "BAR" event so the operator can tail it at a glance:
+//
+//   - BAR …            bold cyan, preceded by a blank line
+//   - ENTRY …          bold green   — strong-conviction signal (|net| ≥ 2.0)
+//   - ENTRY-MED …      cyan         — mid-weight signal      (1.0 ≤ |net| < 2.0)
+//   - ENTRY-WEAK …     yellow       — marginal signal        (|net| < 1.0)
+//   - RESOLVED TP …    green
+//   - RESOLVED SL …    red
+//   - RESOLVED TIMESTOP/BE   magenta
+//   - REJECT …         yellow (filter killed the composite vote)
+//   - NO TRADE …       dim (vote did not cross threshold)
+//   - sleep / poll …   dim
+//
+// Colors are disabled automatically when stdout is not a TTY (file pipe,
+// CI capture) so log files stay greppable.
+type stdoutLogger struct{}
+
+func (stdoutLogger) Log(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	line := decorateLogLine(msg)
+	if isBarStart(msg) {
+		fmt.Println() // visual separator before each new bar block
+	}
+	fmt.Printf("%s[%s]%s %s\n", logDim, time.Now().Format("15:04:05"), logReset, line)
+}
+
+// isBarStart reports whether the message is the heading of a new bar
+// poll cycle — printed in a more prominent style and preceded by a blank
+// line to break the wall of text into per-bar blocks.
+func isBarStart(msg string) bool { return strings.HasPrefix(msg, "BAR  ") }
+
+// decorateLogLine prefixes the message with the ANSI sequence matching its
+// semantic class. Unknown messages pass through uncoloured.
+func decorateLogLine(msg string) string {
+	switch {
+	case strings.HasPrefix(msg, "BAR  "):
+		return logBoldCyan + msg + logReset
+	case strings.HasPrefix(msg, "ENTRY-WEAK "):
+		// |net| < 1.0 — marginal cross of the percentile gate, often a
+		// lightweight strategy alone or near-cancellation of votes. Painted
+		// yellow so the operator immediately sees it's NOT a high-conviction
+		// setup despite being an "entry".
+		return logYellow + msg + logReset
+	case strings.HasPrefix(msg, "ENTRY-MED "):
+		// 1.0 ≤ |net| < 2.0 — one mid-weight strategy (e.g., FVGFill alone)
+		// produced the signal. Cyan distinguishes it from a heavyweight
+		// consensus or a multi-strategy agreement.
+		return logCyan + msg + logReset
+	case strings.HasPrefix(msg, "ENTRY "):
+		// |net| ≥ 2.0 — at least one heavyweight strategy fired
+		// (OrderBlockMit 2.24, SilverBullet 2.13) OR multiple strategies
+		// agreed on the same side. Bold green = high conviction.
+		return logBoldGreen + msg + logReset
+	case strings.HasPrefix(msg, "RESOLVED "):
+		switch {
+		case strings.HasPrefix(msg, "RESOLVED #") && strings.Contains(msg, " TP "):
+			return logGreen + msg + logReset
+		case strings.HasPrefix(msg, "RESOLVED #") && strings.Contains(msg, " SL "):
+			return logRed + msg + logReset
+		default:
+			return logMagenta + msg + logReset
+		}
+	case strings.HasPrefix(msg, "REJECT "):
+		return logYellow + msg + logReset
+	case strings.HasPrefix(msg, "NO TRADE"):
+		return logDim + msg + logReset
+	case strings.HasPrefix(msg, "sleep ") || strings.HasPrefix(msg, "pending=") || strings.HasPrefix(msg, "paper_runs.id="):
+		return logDim + msg + logReset
+	default:
+		return msg
+	}
+}
+
+// ANSI escape codes; set to empty strings at startup when stdout is not a
+// TTY so redirected logs (files, pipes) stay clean.
+var (
+	logReset     = "\x1b[0m"
+	logDim       = "\x1b[2m"
+	logRed       = "\x1b[31m"
+	logGreen     = "\x1b[32m"
+	logYellow    = "\x1b[33m"
+	logMagenta   = "\x1b[35m"
+	logCyan      = "\x1b[36m"
+	logBoldCyan  = "\x1b[1;36m"
+	logBoldGreen = "\x1b[1;32m"
+)
+
+// disableColorsIfNotTTY blanks the ANSI variables when stdout is not a
+// character device (i.e., the output was redirected). Called once at
+// CLI startup from main().
+func disableColorsIfNotTTY() {
+	fi, err := os.Stdout.Stat()
+	if err != nil {
+		return
+	}
+	if fi.Mode()&os.ModeCharDevice != 0 {
+		return // real terminal — keep colors
+	}
+	logReset = ""
+	logDim = ""
+	logRed = ""
+	logGreen = ""
+	logYellow = ""
+	logMagenta = ""
+	logCyan = ""
+	logBoldCyan = ""
+	logBoldGreen = ""
+}
+
+func runPaperLive(args []string) int {
+	fs := flag.NewFlagSet("paper-live", flag.ContinueOnError)
+	runID := fs.Int64("run-id", 0, "backtest_runs.id whose weights drive the live signals (0 = latest canonical)")
+	paperRun := fs.String("paper-run", "", "comma-separated paper_runs.id list to UNION into the weight calc")
+	symbol := fs.String("symbol", "XAU/USD", "symbol to trade")
+	interval := fs.String("interval", "5m", "candle interval (5m/15m/1h/4h)")
+	threshold := fs.Float64("threshold", 2.0, "composite |NetWeight| threshold for an entry (ignored when -threshold-percentile > 0)")
+	thresholdPct := fs.Float64("threshold-percentile", 0.95, "if > 0, gate by the upper-tail percentile of the rolling |NetWeight| distribution; mutually exclusive with -threshold")
+	pdLookback := fs.Int("pd-lookback", 288, "Premium/Discount filter lookback in candles (0 disables, 288 = 24h on 5m)")
+	slippage := fs.Float64("slippage", 0, "SL slippage in dollars (0 disables)")
+	slippageNewsMult := fs.Float64("slippage-news-mult", 1.0, "multiplier applied to slippage in news windows")
+	bySession := fs.Bool("by-session", false, "use per-session weight table instead of the global one")
+	pollSeconds := fs.Int("poll-seconds", 0, "fixed poll cadence in seconds; 0 = align to interval boundary (recommended for free tier)")
+	londonFix := fs.Bool("london-fix", false, "apply the London Gold Fix session adjustment (Phase 3.1): momentum ×0.3 / fade ×1.5 inside the window")
+	londonFixStart := fs.String("london-fix-start", "14:40", "UTC start of the London Fix window (HH:MM)")
+	londonFixEnd := fs.String("london-fix-end", "15:20", "UTC end of the London Fix window (HH:MM)")
+	londonFixMomMult := fs.Float64("london-fix-momentum-mult", 0.3, "weight multiplier for momentum strategies inside the window (0 silences them)")
+	londonFixFadeMult := fs.Float64("london-fix-fade-mult", 1.5, "weight multiplier for liquidity-fade strategies inside the window (1.0 = neutral)")
+	comexPin := fs.Bool("comex-pinning", false, "apply the COMEX expiry pinning filter (Phase 3.2): momentum ×0.0 / mean-reversion ×1.3 inside the 48h pre-expiry window")
+	comexPreHours := fs.Int("comex-pre-hours", 48, "hours BEFORE each seeded GC expiry that the pinning regime kicks in")
+	comexMomMult := fs.Float64("comex-momentum-mult", 0.0, "weight multiplier for momentum strategies inside the COMEX pre-expiry window (0 silences them)")
+	comexFadeMult := fs.Float64("comex-fade-mult", 1.3, "weight multiplier for mean-reversion strategies inside the COMEX pre-expiry window (1.0 = neutral)")
+	dynamicSpread := fs.Bool("dynamic-spread", false, "use the synthetic intraday spread curve (Phase 4.1) instead of the constant SpreadDollar")
+	spreadBase := fs.Float64("spread-base", 0.32, "base spread in USD when -dynamic-spread is enabled")
+	spreadRollMult := fs.Float64("spread-rollover-mult", 3.0, "spread multiplier during the 17:00 NY daily rollover hour")
+	spreadNewsMult := fs.Float64("spread-news-mult", 2.0, "spread multiplier during NY news hours (08, 09, 10, 14)")
+	spreadFilter := fs.Bool("spread-filter", false, "reject signals when modelled spread spikes above SMA (Phase 4.2 stub)")
+	spreadFilterMult := fs.Float64("spread-filter-mult", 1.5, "ratio of current spread to trailing-SMA above which the filter rejects (>= 1.0)")
+	greensSince := fs.Duration("greens-since", 0, "if > 0, print ENTRY-tier (|net|≥2.0) signals from the last <duration> and exit (e.g. 5m, 1h, 24h). Capped at 24h. Pure read-only.")
+	forceRefresh := fs.Bool("force-refresh", false, "rebuild the canonical WFA on startup even if the latest one is <1 trading day old (use after a manual backfill to retrain on completed data)")
+	wppNotify := fs.Bool("wpp-notify", false, "push a WhatsApp message for every ENTRY-tier green signal (|net|≥2.0) via a running go_wpp_bot instance")
+	wppPhone := fs.String("wpp-phone", "573137054945", "destination WhatsApp number for -wpp-notify (country code, no + or suffix)")
+	wppEndpoint := fs.String("wpp-endpoint", "http://127.0.0.1:8080/api/send", "go_wpp_bot send endpoint for -wpp-notify")
+	liveExecute := fs.Bool("live-execute", false, "auto-place every ENTRY-tier green (|net|≥2.0) as a REAL order via the MT5 bridge (fire-and-forget POST to -exec-endpoint). OFF = no orders, bit-for-bit legacy. The bridge's own MT5_ARM gates dry-run vs real money")
+	execEndpoint := fs.String("exec-endpoint", "http://127.0.0.1:9099/order", "MT5 bridge order endpoint for -live-execute")
+	execRisk := fs.Float64("exec-risk", 0.385, "fraction of equity to risk at the SL per real order (the bridge caps this at its own MT5_RISK_PCT ceiling)")
+	liveFeedback := fs.Bool("live-feedback", false, "Tema 2: shrink the canonical weights toward the clean live paper-trade estimate (startup + every auto-refresh). OFF = canonical-only, bit-for-bit legacy")
+	liveFeedbackK := fs.Float64("live-feedback-k", meta.DefaultLiveFeedbackK, "shrinkage constant: clean live trades per strategy for a 50% live say (λ=n/(n+K)); higher = more conservative")
+	liveFeedbackFloor := fs.Int("live-feedback-floor", meta.DefaultLiveFeedbackFloor, "per-strategy clean-live-trade floor below which the live estimate is ignored (small-sample noise guard)")
+	liveFeedbackSince := fs.String("live-feedback-since", "2026-06-09", "ignore live trades before this date (YYYY-MM-DD); default = first fully-clean UTC day after the dedup fix deployed mid-day 2026-06-08, so pre-fix stacked duplicates never feed the weights")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *thresholdPct < 0 || *thresholdPct > 1 {
+		fmt.Fprintln(os.Stderr, "-threshold-percentile must be in [0, 1]")
+		return 2
+	}
+	lfbConfig := meta.LiveFeedbackConfig{
+		Enabled:  *liveFeedback,
+		Symbol:   *symbol,
+		Interval: *interval,
+		K:        *liveFeedbackK,
+		Floor:    *liveFeedbackFloor,
+	}
+	if *liveFeedback {
+		since, perr := time.Parse("2006-01-02", *liveFeedbackSince)
+		if perr != nil {
+			fmt.Fprintf(os.Stderr, "live-feedback-since: %v\n", perr)
+			return 2
+		}
+		lfbConfig.Since = since.UTC()
+	}
+	lfCfg, err := buildLondonFixConfig(*londonFix, *londonFixStart, *londonFixEnd, *londonFixMomMult, *londonFixFadeMult)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	comexCfg, err := buildCOMEXPinConfig(*comexPin, *comexPreHours, *comexMomMult, *comexFadeMult)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	spreadCfg := engine.SpreadCurveConfig{
+		Enabled:       *dynamicSpread,
+		Base:          *spreadBase,
+		RolloverMult:  *spreadRollMult,
+		NewsMult:      *spreadNewsMult,
+		FilterEnabled: *spreadFilter,
+		FilterMult:    *spreadFilterMult,
+		FilterSMABars: 6,
+	}
+	paperRunIDs, err := parsePaperRunIDs(*paperRun)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+
+	apiKey := os.Getenv("TWELVEDATA_API_KEY")
+	if apiKey == "" {
+		fmt.Fprintln(os.Stderr, "ERROR: define TWELVEDATA_API_KEY in .env (free tier is enough)")
+		return 1
+	}
+
+	// SIGINT/SIGTERM → graceful shutdown: the loop finalizes the
+	// paper_runs row, prints a summary, and exits 0. Without this the
+	// run would still be queryable (the row was inserted at startup) but
+	// ended_at would stay equal to started_at.
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	pool, err := openPool(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "db: %v\n", err)
+		return 1
+	}
+	defer pool.Close()
+
+	id := *runID
+	if id == 0 {
+		// "latest canonical" so manual `backtest -persist` experiments don't
+		// silently hijack production. Schema 006 marks the seed (id=19) as
+		// canonical; the auto-refresh goroutine appends a new canonical row
+		// per market trading day.
+		err := pool.QueryRow(ctx, `
+			SELECT id FROM backtest_runs
+			WHERE symbol = $1 AND interval = $2 AND is_canonical = TRUE
+			ORDER BY created_at DESC, id DESC LIMIT 1`,
+			*symbol, *interval).Scan(&id)
+		if err == pgx.ErrNoRows {
+			fmt.Fprintf(os.Stderr, "no canonical backtest_runs row for %s %s — run `backtest -persist` first and `UPDATE backtest_runs SET is_canonical=true WHERE id=...`, or wait for the auto-refresh on next market day\n", *symbol, *interval)
+			return 1
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "find latest canonical run: %v\n", err)
+			return 1
+		}
+	}
+
+	// Resolve weight table ONCE at startup. To incorporate new paper
+	// outcomes mid-run the user restarts the script with `-paper-run=N`
+	// pointing to the just-completed run — same loop, fresher weights.
+	var (
+		flat      map[string]float64
+		bySessTbl map[string]map[string]float64
+	)
+	if *bySession {
+		bySessTbl, err = meta.LoadWeightsBySession(ctx, pool, id, paperRunIDs...)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load weights-by-session: %v\n", err)
+			return 1
+		}
+	} else {
+		var ws []meta.StrategyWeight
+		if *liveFeedback {
+			ws, err = meta.LoadWeightsBlended(ctx, pool, id, lfbConfig)
+		} else {
+			ws, err = meta.LoadWeights(ctx, pool, id, paperRunIDs...)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load weights: %v\n", err)
+			return 1
+		}
+		flat = meta.WeightMap(ws)
+	}
+
+	// Populate COMEX expiry dates from comex_expiry only when the overlay
+	// is actually enabled. Mirrors the wfa subcommand wiring; a miswired
+	// table surfaces immediately rather than degrading into a silent no-op.
+	if comexCfg.Enabled {
+		dates, err := meta.LoadExpiryDates(ctx, pool)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load comex_expiry: %v\n", err)
+			return 1
+		}
+		if len(dates) == 0 {
+			fmt.Fprintln(os.Stderr, "comex_expiry is empty — apply schema/005_comex_expiry.sql first")
+			return 1
+		}
+		comexCfg.ExpiryDates = dates
+	}
+
+	cfg := paper.LiveConfig{
+		SourceRunID: id, BySession: *bySession,
+		Symbol: *symbol, Interval: *interval,
+		Threshold:           *threshold,
+		ThresholdPercentile: *thresholdPct,
+		PDLookback:          *pdLookback,
+		Slippage:            *slippage,
+		SlippageNewsMult:    *slippageNewsMult,
+		PollSeconds:         *pollSeconds,
+		APIKey:              apiKey,
+		HTTPClient:          &http.Client{Timeout: 30 * time.Second},
+		LondonFix:           lfCfg,
+		COMEXPin:            comexCfg,
+		SpreadCurve:         spreadCfg,
+		ForceRefresh:        *forceRefresh,
+		LiveFeedback:        lfbConfig,
+		LiveExecute:         *liveExecute,
+		ExecEndpoint:        *execEndpoint,
+		ExecRiskPct:         *execRisk,
+	}
+
+	// Opt-in WhatsApp push for green signals. Built only when -wpp-notify is
+	// set so the zero-value LiveConfig.Notifier stays nil (no-op) otherwise.
+	if *wppNotify {
+		cfg.Notifier = &notify.WhatsApp{
+			Endpoint: *wppEndpoint,
+			Phone:    *wppPhone,
+			Client:   &http.Client{Timeout: 10 * time.Second},
+		}
+	}
+
+	if *greensSince > 0 {
+		fmt.Printf("═══ Recent Green Signals — %s %s  (last %s) ═══\n", *symbol, *interval, *greensSince)
+		fmt.Printf("  Source weights: backtest_runs.id=%d  ·  bySession=%t\n\n", id, *bySession)
+		if err := paper.ReplayGreens(ctx, pool, cfg, flat, bySessTbl, *greensSince, stdoutLogger{}); err != nil {
+			fmt.Fprintf(os.Stderr, "greens: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+
+	fmt.Printf("═══ Paper Live — %s %s ═══\n", *symbol, *interval)
+	gate := fmt.Sprintf("threshold=%.2f", *threshold)
+	if *thresholdPct > 0 {
+		gate = fmt.Sprintf("threshold-percentile=%.2f", *thresholdPct)
+	}
+	fmt.Printf("  Source weights: backtest_runs.id=%d  ·  bySession=%t  ·  %s\n",
+		id, *bySession, gate)
+	if len(paperRunIDs) > 0 {
+		fmt.Printf("  Feedback paper runs: %v\n", paperRunIDs)
+	}
+	if lfCfg.Enabled {
+		fmt.Printf("  London Fix: ON  window=%02d:%02d-%02d:%02d UTC  momentum×%.2f  fade×%.2f\n",
+			lfCfg.StartHour, lfCfg.StartMin, lfCfg.EndHour, lfCfg.EndMin, lfCfg.MomentumMult, lfCfg.FadeMult)
+	}
+	if comexCfg.Enabled {
+		fmt.Printf("  COMEX Pinning: ON  pre=%dh  momentum×%.2f  fade×%.2f  expiries=%d\n",
+			comexCfg.PreWindowHours, comexCfg.MomentumMult, comexCfg.FadeMult, len(comexCfg.ExpiryDates))
+	}
+	if *wppNotify {
+		fmt.Printf("  WhatsApp: ON  green ENTRY (|net|≥2.0) → %s via %s\n", *wppPhone, *wppEndpoint)
+	}
+	if *liveExecute {
+		fmt.Printf("  ⚠ LIVE EXECUTE: ON  green ENTRY (|net|≥2.0) → REAL order via %s (risk %.1f%%; bridge MT5_ARM gates real vs dry-run)\n",
+			*execEndpoint, *execRisk*100)
+	}
+	if *liveFeedback {
+		fmt.Printf("  Live feedback: ON  shrink toward canonical (K=%.0f, floor=%d, since=%s)\n",
+			*liveFeedbackK, *liveFeedbackFloor, lfbConfig.Since.Format("2006-01-02"))
+	}
+	if *pollSeconds > 0 {
+		fmt.Printf("  Poll cadence: every %ds (fixed)\n", *pollSeconds)
+	} else {
+		fmt.Printf("  Poll cadence: aligned to %s boundary + 10s slack (~%d API calls/day)\n",
+			*interval, callsPerDay(*interval))
+	}
+	fmt.Println("  Press Ctrl+C to stop and finalize the run.")
+	fmt.Println()
+
+	paperRunID, err := paper.RunLive(ctx, pool, cfg, flat, bySessTbl, paperRunIDs, stdoutLogger{})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "live: %v\n", err)
+		return 1
+	}
+
+	// Print the closing summary using the persisted paper_trades rows so
+	// it reflects what's actually saved, not in-memory state.
+	summarizeLiveRun(context.Background(), pool, paperRunID)
+	return 0
+}
+
+// callsPerDay estimates the daily REST request count for a given interval
+// at the default aligned cadence. Used only for the startup banner so the
+// user knows whether their TD quota is at risk.
+func callsPerDay(interval string) int {
+	switch interval {
+	case "5m":
+		return 24 * 12 // 288 — fits under TD free-tier's 800/day
+	case "15m":
+		return 24 * 4 // 96
+	case "1h":
+		return 24
+	case "4h":
+		return 6
+	case "1d":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func summarizeLiveRun(ctx context.Context, pool *pgxpool.Pool, paperRunID int64) {
+	var closed, open int
+	var netR *float64
+	_ = pool.QueryRow(ctx, `SELECT COUNT(*), COALESCE(SUM(r_realized), 0) FROM paper_trades WHERE paper_run_id=$1`, paperRunID).Scan(&closed, &netR)
+	_ = pool.QueryRow(ctx, `SELECT COUNT(*) FROM paper_pending WHERE paper_run_id=$1`, paperRunID).Scan(&open)
+	fmt.Println()
+	fmt.Printf("── Live run paper_runs.id=%d summary ──────────────────────\n", paperRunID)
+	fmt.Printf("  closed=%d  pending=%d\n", closed, open)
+	if netR != nil {
+		fmt.Printf("  NetR=%+.2f  (closed trades only)\n", *netR)
+	}
+	fmt.Printf("\n  Inspect: psql -c \"SELECT entry_time, strategy, side, r_realized, win FROM paper_trades WHERE paper_run_id=%d ORDER BY entry_time;\"\n", paperRunID)
+}
+
+// runShadowStats aggregates shadow_trades — counter-factual records of
+// signals that acceptSignal rejected (BIAS / PD / MAXSL gates), graded
+// against the same lifecycle as real paper trades. Use this to decide
+// whether a filter is earning its rejection rate (rejections should have
+// WR < accepted trades) or leaving R on the table (rejections WR > accepted
+// means the gate is overactive and worth relaxing in the next WFA cycle).
+//
+// Default groups by rejecter (the strategy whose signal was rejected); use
+// -by-gate to slice by which gate fired instead. -run-id=0 picks the most
+// recent live paper_runs row, matching the convention of weights/bootstrap.
+func runShadowStats(args []string) int {
+	fs := flag.NewFlagSet("shadow-stats", flag.ContinueOnError)
+	runID := fs.Int64("run-id", 0, "paper_runs.id to aggregate (0 = latest live run)")
+	byGate := fs.Bool("by-gate", false, "group by reject_gate (BIAS|PD|MAXSL) instead of by rejecter strategy")
+	includeOpen := fs.Bool("include-open", false, "also report count of in-flight shadows (status='open')")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	ctx := context.Background()
+	pool, err := openPool(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "db: %v\n", err)
+		return 1
+	}
+	defer pool.Close()
+
+	id := *runID
+	if id == 0 {
+		err = pool.QueryRow(ctx, `
+			SELECT id FROM paper_runs
+			WHERE is_live = true
+			ORDER BY id DESC LIMIT 1`).Scan(&id)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "find latest live paper_run: %v\n", err)
+			return 1
+		}
+	}
+
+	groupCol := "rejecter"
+	if *byGate {
+		groupCol = "reject_gate"
+	}
+	rows, err := pool.Query(ctx, fmt.Sprintf(`
+		SELECT %s AS bucket,
+		       COUNT(*)                          AS n,
+		       AVG(CASE WHEN win THEN 1.0 ELSE 0.0 END) AS wr,
+		       SUM(r_realized)                   AS net_r,
+		       AVG(r_realized)                   AS mean_r,
+		       AVG(candles_to_exit)              AS mean_bars
+		FROM shadow_trades
+		WHERE paper_run_id = $1 AND status = 'closed'
+		GROUP BY %s
+		ORDER BY net_r DESC`, groupCol, groupCol), id)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "shadow query: %v\n", err)
+		return 1
+	}
+	defer rows.Close()
+
+	type row struct {
+		bucket   string
+		n        int
+		wr       float64
+		netR     float64
+		meanR    float64
+		meanBars float64
+	}
+	var data []row
+	var totalN int
+	var totalNetR float64
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.bucket, &r.n, &r.wr, &r.netR, &r.meanR, &r.meanBars); err != nil {
+			fmt.Fprintf(os.Stderr, "scan: %v\n", err)
+			return 1
+		}
+		data = append(data, r)
+		totalN += r.n
+		totalNetR += r.netR
+	}
+	if err := rows.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "rows: %v\n", err)
+		return 1
+	}
+
+	bucketHdr := "Rejecter"
+	if *byGate {
+		bucketHdr = "Gate"
+	}
+	fmt.Printf("\nShadow stats — paper_runs.id=%d  (%d closed shadow trades)\n\n", id, totalN)
+	if totalN == 0 {
+		fmt.Println("  no closed shadows yet — run paper-live long enough for rejections to grade out")
+	} else {
+		fmt.Printf("  %-18s  %6s  %7s  %9s  %8s  %9s\n", bucketHdr, "N", "WR%", "NetR", "MeanR", "MeanBars")
+		fmt.Printf("  %-18s  %6s  %7s  %9s  %8s  %9s\n", "------------------", "------", "-------", "---------", "--------", "---------")
+		for _, r := range data {
+			fmt.Printf("  %-18s  %6d  %6.1f%%  %+9.2f  %+8.3f  %9.1f\n",
+				r.bucket, r.n, r.wr*100, r.netR, r.meanR, r.meanBars)
+		}
+		fmt.Printf("  %-18s  %6s  %7s  %9s\n", "------------------", "------", "-------", "---------")
+		fmt.Printf("  %-18s  %6d  %7s  %+9.2f\n", "TOTAL", totalN, "", totalNetR)
+		fmt.Println()
+		fmt.Println("  Reading: NetR > 0 on a rejecter/gate ⇒ filter is leaving R on the table;")
+		fmt.Println("           NetR < 0 ⇒ filter is earning its rejection. Compare to live paper_trades")
+		fmt.Println("           WR/NetR on the same run before relaxing anything.")
+	}
+
+	if *includeOpen {
+		var openN int
+		if err := pool.QueryRow(ctx, `
+			SELECT COUNT(*) FROM shadow_trades
+			WHERE paper_run_id = $1 AND status = 'open'`, id).Scan(&openN); err != nil {
+			fmt.Fprintf(os.Stderr, "open count: %v\n", err)
+		} else {
+			fmt.Printf("\n  in-flight shadows (status='open'): %d\n", openN)
+		}
+	}
+	return 0
+}
+
+func runCapitalSim(args []string) int {
+	fs := flag.NewFlagSet("capital-sim", flag.ContinueOnError)
+	runID := fs.Int64("run-id", 0, "backtest_runs.id whose trades drive the sim (0 = latest)")
+	wfaRunID := fs.Int64("wfa-run", 0, "wfa_runs.id (use composite OOS trades instead of per-strategy backtest trades)")
+	paperRunID := fs.Int64("paper-run", 0, "paper_runs.id (use graded paper trades)")
+	capitalStart := fs.Float64("capital", 280, "initial bankroll in USD")
+	riskFirst := fs.Float64("risk-first", 0.333, "fraction of capital risked on the first trade of the day")
+	riskMart := fs.Float64("risk-martingale", 0.666, "fraction of REMAINING capital risked on the second trade after a loss")
+	maxTrades := fs.Int("max-trades", 2, "max attempts per day (2 = first + one martingale)")
+	reloadThresh := fs.Float64("reload-threshold", 10, "capital below this triggers a reload")
+	reloadAmt := fs.Float64("reload-amount", 200, "USD the capital is set to on reload")
+	minTrades := fs.Int("min-trades", 30, "skip strategies whose total trade count is below this (noise filter)")
+	strategyFilter := fs.String("strategy", "", "if set, simulate ONLY trades from this strategy (works with any source flag)")
+	tiersFlag := fs.String("tiers", "", "capital-band tiers \"threshold:risk[,threshold:risk]...\" — e.g. \"100000:0.1925,1000000:0.0963\" steps down to Half/Quarter Kelly at $100k/$1M")
+	autocorrOn := fs.Bool("autocorr", false, "enable autocorr-aware Kelly: scale risk by (1 − λ·max(0,ρ_1)) where ρ_1 is the lag-1 autocorr of recent R-multiples (clustering of losses cuts size)")
+	autocorrWin := fs.Int("autocorr-window", 20, "size of the rolling R-window used to estimate ρ_1 (penalty stays off until this many trades have closed)")
+	autocorrLam := fs.Float64("autocorr-lambda", 1.5, "autocorr-aware Kelly penalty aggressiveness λ (higher = more shrinkage when ρ_1>0; ρ_1≥1/λ clamps risk to 0)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	tiers, err := parseTiers(*tiersFlag)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+
+	// Mutually-exclusive source flags.
+	sourceCount := 0
+	if *runID != 0 {
+		sourceCount++
+	}
+	if *wfaRunID != 0 {
+		sourceCount++
+	}
+	if *paperRunID != 0 {
+		sourceCount++
+	}
+	if sourceCount > 1 {
+		fmt.Fprintln(os.Stderr, "-run-id, -wfa-run and -paper-run are mutually exclusive")
+		return 2
+	}
+
+	ctx := context.Background()
+	pool, err := openPool(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "db: %v\n", err)
+		return 1
+	}
+	defer pool.Close()
+
+	cfg := capital.Config{
+		StartCapital:      *capitalStart,
+		FirstRiskPct:      *riskFirst,
+		MartingaleRiskPct: *riskMart,
+		MaxTradesPerDay:   *maxTrades,
+		ReloadThreshold:   *reloadThresh,
+		ReloadAmount:      *reloadAmt,
+		Tiers:             tiers,
+		AutocorrEnabled:   *autocorrOn,
+		AutocorrWindow:    *autocorrWin,
+		AutocorrLambda:    *autocorrLam,
+	}
+
+	// Decide the trade source.
+	var (
+		header   string
+		groups   map[string][]core.Trade
+		oneShot  bool
+		oneLabel string
+	)
+	switch {
+	case *wfaRunID != 0:
+		trades, err := loadWFATrades(ctx, pool, *wfaRunID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load wfa trades: %v\n", err)
+			return 1
+		}
+		header = fmt.Sprintf("Capital Sim — wfa_runs.id=%d (composite OOS curve, %d trades)", *wfaRunID, len(trades))
+		oneShot = true
+		oneLabel = fmt.Sprintf("Composite (wfa#%d)", *wfaRunID)
+		groups = map[string][]core.Trade{oneLabel: trades}
+	case *paperRunID != 0:
+		trades, err := loadPaperTrades(ctx, pool, *paperRunID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load paper trades: %v\n", err)
+			return 1
+		}
+		header = fmt.Sprintf("Capital Sim — paper_runs.id=%d (live/replay trades, %d trades)", *paperRunID, len(trades))
+		oneShot = true
+		oneLabel = fmt.Sprintf("Paper (paper#%d)", *paperRunID)
+		groups = map[string][]core.Trade{oneLabel: trades}
+	default:
+		id := *runID
+		if id == 0 {
+			if err := pool.QueryRow(ctx, `SELECT id FROM backtest_runs ORDER BY id DESC LIMIT 1`).Scan(&id); err != nil {
+				fmt.Fprintf(os.Stderr, "find latest run: %v\n", err)
+				return 1
+			}
+		}
+		trades, err := loadBacktestTrades(ctx, pool, id)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load trades: %v\n", err)
+			return 1
+		}
+		header = fmt.Sprintf("Capital Sim — backtest_runs.id=%d (per-strategy, %d trades total)", id, len(trades))
+		groups = map[string][]core.Trade{}
+		for _, t := range trades {
+			groups[t.Strategy] = append(groups[t.Strategy], t)
+		}
+	}
+
+	fmt.Printf("\n═══ %s ═══\n", header)
+	fmt.Printf("  Capital=$%.2f  RiskFirst=%.1f%%  Martingale=%.1f%%  MaxTrades=%d/day  Reload@<$%.0f→$%.0f\n\n",
+		cfg.StartCapital, cfg.FirstRiskPct*100, cfg.MartingaleRiskPct*100,
+		cfg.MaxTradesPerDay, cfg.ReloadThreshold, cfg.ReloadAmount)
+
+	// Optional per-strategy filter — narrows any source down to one
+	// strategy's trades. Useful when you want to know what e.g. OBM
+	// alone would produce on the WFA OOS curve (where it's the
+	// dominant honest contributor).
+	if *strategyFilter != "" {
+		filtered := map[string][]core.Trade{}
+		for name, ts := range groups {
+			var keep []core.Trade
+			for _, t := range ts {
+				if t.Strategy == *strategyFilter {
+					keep = append(keep, t)
+				}
+			}
+			if len(keep) > 0 {
+				filtered[name+" / "+*strategyFilter] = keep
+			}
+		}
+		groups = filtered
+	}
+
+	// Run sim per group, collect.
+	results := make([]capital.Result, 0, len(groups))
+	for name, ts := range groups {
+		if !oneShot && *strategyFilter == "" && len(ts) < *minTrades {
+			continue
+		}
+		results = append(results, capital.Simulate(name, ts, cfg))
+	}
+	// Sort by ROI desc — winner on top.
+	sort.Slice(results, func(i, j int) bool { return results[i].ROIPct > results[j].ROIPct })
+
+	// Print comparison table.
+	fmt.Printf("  %-18s  %-9s  %-9s  %-9s  %-7s  %-7s  %-6s  %-7s\n",
+		"Strategy", "Final$", "Net$", "ROI%", "Days", "Mart", "Bust", "MaxDD%")
+	for _, r := range results {
+		fmt.Printf("  %-18s  %9.2f  %+9.2f  %+7.1f%%  %5d   %5d   %4d   %5.1f%%\n",
+			r.Strategy, r.FinalCapital, r.NetProfit, r.ROIPct,
+			r.DaysWithTrades, r.DaysWithMartingale, r.DaysBusted, r.MaxDrawdownPct*100)
+	}
+
+	if !oneShot {
+		fmt.Println()
+		fmt.Printf("  Legend: Days = days with ≥1 trade, Mart = days where martingale fired,\n")
+		fmt.Printf("  Bust = days that triggered a reload, Net$ = profit MINUS total reloads paid.\n")
+		fmt.Printf("  Skipped strategies with <%d trades (signal too sparse to evaluate).\n", *minTrades)
+	}
+	return 0
+}
+
+// loadPaperTrades pulls closed paper trades for capital-sim. Only the
+// fields the sim consumes (strategy, side, r_realized, win, times) are
+// hydrated — mirrors loadWFATrades.
+func loadPaperTrades(ctx context.Context, pool *pgxpool.Pool, paperRunID int64) ([]core.Trade, error) {
+	rows, err := pool.Query(ctx, `
+		SELECT strategy, side, r_realized, win, entry_time, exit_time
+		FROM paper_trades
+		WHERE paper_run_id = $1
+		ORDER BY entry_time ASC
+	`, paperRunID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []core.Trade
+	for rows.Next() {
+		var t core.Trade
+		var sideStr string
+		if err := rows.Scan(&t.Strategy, &sideStr, &t.R, &t.Win, &t.EntryTime, &t.ExitTime); err != nil {
+			return nil, err
+		}
+		if sideStr == "SHORT" {
+			t.Side = core.Short
+		} else {
+			t.Side = core.Long
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+func runImportCache(args []string) int {
+	fs := flag.NewFlagSet("import-cache", flag.ContinueOnError)
+	file := fs.String("file", "cache_xauusd_15m.json", "path to legacy JSON cache")
+	symbol := fs.String("symbol", "XAU/USD", "symbol")
+	interval := fs.String("interval", "15m", "interval label")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	candles, err := loadCacheJSON(*file)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load cache: %v\n", err)
+		return 1
+	}
+	if len(candles) == 0 {
+		fmt.Println("cache empty, nothing to import")
+		return 0
+	}
+
+	ctx := context.Background()
+	pool, err := openPool(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "db: %v\n", err)
+		return 1
+	}
+	defer pool.Close()
+
+	inserted, err := upsertCandles(ctx, pool, *symbol, *interval, candles)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "upsert: %v\n", err)
+		return 1
+	}
+	fmt.Printf("imported %d new candles (of %d in file) for %s %s\n",
+		inserted, len(candles), *symbol, *interval)
+	return 0
+}
