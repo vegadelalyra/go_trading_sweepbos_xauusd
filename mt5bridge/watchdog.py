@@ -60,16 +60,22 @@ def probe():
 
 
 def main():
-    # Assume healthy at boot so a first probe that is DOWN fires an alert (you
-    # want to know), while a healthy start stays quiet.
+    # Assume healthy at start; only alert on CHANGES. A startup grace window
+    # suppresses alerts while MT5/bridge are still coming up after a reboot, so we
+    # don't fire a spurious CAIDA->RECUPERADA pair on every boot. State is still
+    # tracked during grace; real changes after it alert normally.
     last = True
-    print(f"[watchdog] polling {HEALTH_URL} every {INTERVAL}s")
+    grace = int(os.environ.get("MT5_WATCH_GRACE", "120"))
+    started = time.time()
+    print(f"[watchdog] polling {HEALTH_URL} every {INTERVAL}s (grace {grace}s)", flush=True)
     while True:
         healthy, detail = probe()
         if healthy != last:
             last = healthy
-            send_whatsapp(format_watchdog_message(healthy, detail))
-            print(f"[watchdog] state change -> healthy={healthy}: {detail}")
+            warming = (time.time() - started) < grace
+            if not warming:
+                send_whatsapp(format_watchdog_message(healthy, detail))
+            print(f"[watchdog] state change -> healthy={healthy} (warming={warming}): {detail}", flush=True)
         time.sleep(INTERVAL)
 
 
