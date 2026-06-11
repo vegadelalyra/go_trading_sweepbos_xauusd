@@ -182,3 +182,18 @@ def format_watchdog_message(healthy, detail):
     """ASCII-only WhatsApp text for a bridge health state change."""
     head = "WATCHDOG: ejecucion RECUPERADA" if healthy else "WATCHDOG: ejecucion CAIDA"
     return f"{head}\n{detail}"
+
+
+def daily_loss_breached(equity, day_start_equity, max_loss_pct):
+    """True if `equity` has fallen more than `max_loss_pct` (a fraction, e.g. 0.5
+    for 50%) below `day_start_equity`. A hard circuit breaker against the
+    38.5%-flat drawdown. max_loss_pct<=0 (or a missing/invalid baseline) disables
+    the check -> returns False (no behavior change). Pure -> unit-testable."""
+    try:
+        if not max_loss_pct or max_loss_pct <= 0:
+            return False
+        if not day_start_equity or day_start_equity <= 0:
+            return False
+        return float(equity) <= float(day_start_equity) * (1.0 - float(max_loss_pct))
+    except (TypeError, ValueError):
+        return False

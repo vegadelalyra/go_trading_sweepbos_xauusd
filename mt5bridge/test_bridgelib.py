@@ -4,7 +4,8 @@ import tempfile
 
 from bridgelib import (signal_key, append_order, load_recent_keys, format_fill_message,
                        is_transient_retcode, retcode_name, send_with_retry,
-                       format_reject_message, format_expiry_message, format_watchdog_message)
+                       format_reject_message, format_expiry_message, format_watchdog_message,
+                       daily_loss_breached)
 
 
 def test_signal_key():
@@ -149,6 +150,22 @@ def test_format_watchdog_message():
     assert down.startswith("WATCHDOG: ejecucion CAIDA")
     assert up.startswith("WATCHDOG: ejecucion RECUPERADA")
     assert down.isascii() and up.isascii()
+
+
+def test_daily_loss_breached():
+    # disabled by default (max_loss_pct 0) -> never breaches, whatever the equity
+    assert not daily_loss_breached(100.0, 380.0, 0)
+    assert not daily_loss_breached(100.0, 380.0, 0.0)
+    # 50% limit: 380 -> 190 is the line
+    assert not daily_loss_breached(200.0, 380.0, 0.5)   # above the line, OK
+    assert daily_loss_breached(190.0, 380.0, 0.5)       # exactly at the line -> breached
+    assert daily_loss_breached(150.0, 380.0, 0.5)       # well below -> breached
+    # 38.5% limit
+    assert daily_loss_breached(380.0 * 0.6, 380.0, 0.385)
+    assert not daily_loss_breached(380.0 * 0.7, 380.0, 0.385)
+    # bad/missing baseline -> disabled
+    assert not daily_loss_breached(10.0, 0, 0.5)
+    assert not daily_loss_breached(10.0, None, 0.5)
 
 
 if __name__ == "__main__":

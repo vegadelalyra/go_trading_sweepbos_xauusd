@@ -37,7 +37,8 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from bridgelib import (signal_key, append_order, load_recent_keys,
-                       format_fill_message, format_reject_message, format_expiry_message)
+                       format_fill_message, format_reject_message, format_expiry_message,
+                       daily_loss_breached)
 from execute import place_order, MAGIC, SYMBOL, DEFAULT_RISK, EXPIRATION_MIN
 
 try:
@@ -62,6 +63,11 @@ WPP_ENDPOINT = os.environ.get("MT5_WPP_ENDPOINT", "http://127.0.0.1:8080/api/sen
 WPP_PHONE = os.environ.get("MT5_WPP_PHONE", "573137054945")
 WPP_NOTIFY = os.environ.get("MT5_WPP_NOTIFY", "1") == "1"
 
+# Optional daily-loss circuit breaker: refuse NEW orders once equity has fallen
+# more than this fraction below the day's starting equity. 0 = disabled (default,
+# no behavior change). A hard defense against the 38.5%-flat drawdown.
+MAX_DAILY_LOSS_PCT = float(os.environ.get("MT5_MAX_DAILY_LOSS_PCT", "0"))
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("mt5bridge")
 
@@ -82,6 +88,19 @@ known_positions = set()
 # (placed_at + EXPIRATION_MIN), so host/broker timezone skew never affects expiry
 # detection.
 pending_tracked = {}
+# daily-loss circuit breaker state: UTC-day baseline + once-per-day alert flag.
+day_start_equity = None
+day_start_date = None
+daily_loss_alerted_date = None
+
+
+def _refresh_daily_baseline(equity):
+    """Reset the daily-loss baseline at each new UTC day (or on first call)."""
+    global day_start_equity, day_start_date
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    if day_start_date != today or day_start_equity is None:
+        day_start_date = today
+        day_start_equity = float(equity)
 
 
 # ─────────────────────────────── helpers ──────────────────────────────────────
@@ -344,7 +363,17 @@ class Handler(BaseHTTPRequestHandler):
             if not ensure_mt5():
                 return self._json(200, {"ok": False, "key": key,
                                         "reason": "MT5 not connected -- is the terminal open AND logged in?"})
-            r = place_order(side, entry, sl, tp, risk_pct=risk, arm=ARM)
+            # daily-loss circuit breaker (optional; MT5_MAX_DAILY_LOSS_PCT>0 enables)
+            _acc = mt5.account_info()
+            _eq = float(_acc.equity) if _acc else 0.0
+            _refresh_daily_baseline(_eq)
+            if daily_loss_breached(_eq, day_start_equity, MAX_DAILY_LOSS_PCT):
+                r = {"ok": False, "daily_loss": True, "dry_run": not ARM,
+                     "equity": _eq, "day_start_equity": day_start_equity,
+                     "reason": (f"daily-loss limit: equity ${_eq:.2f} <= "
+                                f"{(1.0 - MAX_DAILY_LOSS_PCT) * 100:.0f}% of day-start ${day_start_equity:.2f}")}
+            else:
+                r = place_order(side, entry, sl, tp, risk_pct=risk, arm=ARM)
 
         r["key"] = key
         r["strategy"] = strategy
@@ -367,6 +396,13 @@ class Handler(BaseHTTPRequestHandler):
                        "entry": entry, "sl": sl, "tp": tp, "lots": r["lots"],
                        "actual_risk": r["actual_risk"], "ticket": r.get("ticket"),
                        "retcode": r.get("retcode"), "reason": r["reason"]})
+        elif r.get("daily_loss"):
+            log_order({"event": "daily_loss", "key": key, "reason": r["reason"]})
+            global daily_loss_alerted_date
+            _today = time.strftime("%Y-%m-%d", time.gmtime())
+            if daily_loss_alerted_date != _today:
+                daily_loss_alerted_date = _today
+                send_whatsapp("CIRCUIT BREAKER diario -- ejecucion pausada. " + r["reason"])
         elif not r["dry_run"] and r.get("sent"):
             # A REAL order reached the broker and was definitively rejected
             # (transient retries already exhausted in place_order). Alert so the
