@@ -36,8 +36,9 @@ import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from bridgelib import signal_key, append_order, load_recent_keys, format_fill_message
-from execute import place_order, MAGIC, SYMBOL, DEFAULT_RISK
+from bridgelib import (signal_key, append_order, load_recent_keys,
+                       format_fill_message, format_reject_message, format_expiry_message)
+from execute import place_order, MAGIC, SYMBOL, DEFAULT_RISK, EXPIRATION_MIN
 
 try:
     import MetaTrader5 as mt5
@@ -76,6 +77,11 @@ placed_orders = {}
 # position tickets already known/notified, so reconciliation + poll never
 # re-notify a pre-existing or already-announced position.
 known_positions = set()
+# pending LIMITs we placed for real, by order ticket, so the poll loop can alert
+# when one EXPIRES without filling. Each value carries a HOST-clock deadline
+# (placed_at + EXPIRATION_MIN), so host/broker timezone skew never affects expiry
+# detection.
+pending_tracked = {}
 
 
 # ─────────────────────────────── helpers ──────────────────────────────────────
@@ -222,6 +228,34 @@ def _match_placed(p):
     return None
 
 
+def detect_expiries(now):
+    """Records for our pending LIMITs that are GONE from the order book, did NOT
+    become a position, and are past their host-clock deadline -> expired unfilled.
+    Pops them from pending_tracked so each expiry alerts at most once."""
+    expired = []
+    with MT5_LOCK:
+        if not ensure_mt5():
+            return expired
+        live = {o.ticket for o in (mt5.orders_get(symbol=SYMBOL) or [])}
+        positions = mt5.positions_get(symbol=SYMBOL) or []
+        for ticket, rec in list(pending_tracked.items()):
+            if ticket in live:
+                continue  # still resting on the book
+            filled = any(getattr(p, "magic", 0) == MAGIC
+                         and round(p.sl, 2) == round(rec.get("sl", 0) or 0, 2)
+                         and round(p.tp, 2) == round(rec.get("tp", 0) or 0, 2)
+                         for p in positions)
+            if filled:
+                pending_tracked.pop(ticket, None)  # the fill path announces it
+                continue
+            if now >= rec.get("deadline", 0):
+                pending_tracked.pop(ticket, None)
+                expired.append({**rec, "ticket": ticket})
+            # else: gone before deadline w/o a position (early cancel or a brief
+            # fill-race) -> keep one cycle; resolves to filled or past-deadline.
+    return expired
+
+
 def poll_loop():
     while True:
         time.sleep(POLL_SEC)
@@ -236,7 +270,16 @@ def poll_loop():
                            "margin", "equity")}})
                 send_whatsapp(format_fill_message(info))
         except Exception as e:
-            log.warning("poll error: %s", e)
+            log.warning("poll error (fills): %s", e)
+        try:
+            for rec in detect_expiries(int(time.time())):
+                log.info("EXPIRY %s ticket=%s entry=%.2f -- LIMIT expired unfilled",
+                         rec.get("side"), rec.get("ticket"), float(rec.get("entry") or 0.0))
+                log_order({"event": "expiry", **{k: rec.get(k) for k in
+                          ("side", "symbol", "ticket", "strategy", "entry", "sl", "tp", "key")}})
+                send_whatsapp(format_expiry_message(rec))
+        except Exception as e:
+            log.warning("poll error (expiry): %s", e)
 
 
 # ─────────────────────────────── HTTP handler ─────────────────────────────────
@@ -310,11 +353,30 @@ class Handler(BaseHTTPRequestHandler):
             if r.get("ticket"):
                 placed_orders[r["ticket"]] = {"strategy": strategy, "key": key,
                                               "side": side, "entry": entry, "sl": sl, "tp": tp}
+                # Track REAL pending LIMITs (dry-runs have no ticket) so the poll
+                # loop can alert if this one EXPIRES unfilled. Deadline on the HOST
+                # clock so host/broker tz skew never affects expiry detection.
+                if not r["dry_run"]:
+                    pending_tracked[r["ticket"]] = {
+                        "strategy": strategy, "key": key, "side": side,
+                        "symbol": SYMBOL, "entry": entry, "sl": sl, "tp": tp,
+                        "deadline": int(time.time()) + EXPIRATION_MIN * 60,
+                    }
             log_order({"event": "placed" if not r["dry_run"] else "dryrun",
                        "key": key, "strategy": strategy, "side": side,
                        "entry": entry, "sl": sl, "tp": tp, "lots": r["lots"],
                        "actual_risk": r["actual_risk"], "ticket": r.get("ticket"),
                        "retcode": r.get("retcode"), "reason": r["reason"]})
+        elif not r["dry_run"] and r.get("sent"):
+            # A REAL order reached the broker and was definitively rejected
+            # (transient retries already exhausted in place_order). Alert so the
+            # failure is never silent. one-at-a-time / 0-lot skips have sent=False
+            # and stay quiet (expected, not a broker rejection).
+            log_order({"event": "reject", "key": key, "strategy": strategy,
+                       "side": side, "entry": entry, "sl": sl, "tp": tp,
+                       "retcode": r.get("retcode"), "attempts": r.get("attempts"),
+                       "reason": r["reason"]})
+            send_whatsapp(format_reject_message(r))
         log.info("ORDER key=%s side=%s -> ok=%s dry=%s reason=%s lots=%s ticket=%s",
                  key, side, r.get("ok"), r.get("dry_run"), r.get("reason"),
                  r.get("lots"), r.get("ticket"))

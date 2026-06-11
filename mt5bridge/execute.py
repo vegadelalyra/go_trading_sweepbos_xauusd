@@ -30,6 +30,7 @@ import sys
 import time
 
 from sizing import compute_lots
+from bridgelib import is_transient_retcode, send_with_retry, retcode_name
 
 try:
     import MetaTrader5 as mt5
@@ -68,6 +69,7 @@ def place_order(side, entry, sl, tp, risk_pct=DEFAULT_RISK, arm=False,
         "target_risk": 0.0, "actual_risk": 0.0, "detail": "",
         "equity": 0.0, "margin": 0.0, "equity_after": 0.0, "free_after": 0.0,
         "retcode": None, "comment": "", "ticket": None, "expiration": None,
+        "sent": False, "attempts": 0,
     }
     if side not in ("BUY", "SELL"):
         out["reason"] = f"bad side {side!r} (want BUY/SELL)"
@@ -148,15 +150,35 @@ def place_order(side, entry, sl, tp, risk_pct=DEFAULT_RISK, arm=False,
         out["reason"] = "REFUSE arm: terminal Algo-Trading is OFF -- enable it in the MT5 toolbar first."
         return out
 
-    res = mt5.order_send(req)
+    # Send with bounded retry on TRANSIENT trade-server conditions (no connection
+    # / requote / no prices). order_check above already validated the request, so
+    # a None / transient result here means "not placed" -> safe to re-send inside
+    # the LIMIT's 15-min window. Terminal codes are NOT retried. The whole loop
+    # runs under the caller's MT5_LOCK, so re-sends never race the poll thread.
+    out["sent"] = True
+
+    def _transient(r):
+        # IPC error (None) treated as transient: connection blip, nothing placed.
+        return True if r is None else is_transient_retcode(getattr(r, "retcode", None))
+
+    res, tries, retries = send_with_retry(
+        lambda: mt5.order_send(req), _transient, mt5.TRADE_RETCODE_DONE,
+        attempts=int(os.environ.get("MT5_RETRY_ATTEMPTS", "3")),
+        backoff=float(os.environ.get("MT5_RETRY_BACKOFF_SEC", "4")),
+        max_sec=float(os.environ.get("MT5_RETRY_MAX_SEC", "20")),
+    )
+    out["attempts"] = tries
+    if retries:
+        out["retries"] = retries
     if res is None:
-        out["reason"] = f"order_send returned None: {mt5.last_error()}"
+        out["reason"] = f"order_send returned None after {tries} attempt(s): {mt5.last_error()}"
         return out
     out["retcode"] = int(res.retcode)
     out["comment"] = str(res.comment)
     out["ticket"] = int(getattr(res, "order", 0)) or None
     out["ok"] = (res.retcode == mt5.TRADE_RETCODE_DONE)
-    out["reason"] = "PLACED" if out["ok"] else f"order_send retcode={res.retcode}: {res.comment}"
+    out["reason"] = ("PLACED" if out["ok"]
+                     else f"order_send retcode={res.retcode} ({retcode_name(res.retcode)}): {res.comment}")
     return out
 
 

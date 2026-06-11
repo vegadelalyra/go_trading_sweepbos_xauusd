@@ -74,3 +74,111 @@ def format_fill_message(d):
                  f"libre=${d.get('free', 0.0):.2f}")
     lines.append(f"ticket={d.get('ticket')}")
     return "\n".join(lines)
+
+
+# ───────────────────────── retcode classification + retry ─────────────────────
+#
+# MetaTrader5 trade-server return codes (subset), names per the MQL5 docs. Kept
+# here (MT5-free) so the retry policy and classifier unit-test on plain python3.
+RETCODE_NAMES = {
+    0: "OK", 10009: "DONE",
+    10004: "REQUOTE", 10006: "REJECT", 10013: "INVALID", 10014: "INVALID_VOLUME",
+    10015: "INVALID_PRICE", 10016: "INVALID_STOPS", 10017: "TRADE_DISABLED",
+    10018: "MARKET_CLOSED", 10019: "NO_MONEY", 10021: "PRICE_OFF",
+    10024: "TOO_MANY_REQUESTS", 10027: "CLIENT_DISABLES_AT", 10031: "CONNECTION",
+}
+
+# Retry ONLY on these transient, server-side conditions — the order was NOT
+# placed (no connection / requote / no prices), so a bounded re-send inside the
+# signal window is safe and recovers the failure modes seen in production
+# (notably 10031). Anything NOT in this set is treated as terminal: fail fast,
+# alert, never retry (e.g. 10015 invalid price, 10016 invalid stops, 10018 market
+# closed, 10019 no money, 10027 algo disabled).
+TRANSIENT_RETCODES = frozenset({10004, 10021, 10031})
+
+
+def is_transient_retcode(rc):
+    """True iff `rc` is a transient trade-server condition worth retrying.
+    Non-numeric / unknown / None -> False (treated as terminal)."""
+    try:
+        return int(rc) in TRANSIENT_RETCODES
+    except (TypeError, ValueError):
+        return False
+
+
+def retcode_name(rc):
+    """Human name for a retcode, falling back to its number as a string."""
+    try:
+        return RETCODE_NAMES.get(int(rc), str(rc))
+    except (TypeError, ValueError):
+        return str(rc)
+
+
+def send_with_retry(order_send, classify_transient, done_retcode, *,
+                    attempts=3, backoff=4.0, max_sec=20.0,
+                    sleep=time.sleep, clock=time.time):
+    """Call `order_send()` up to `attempts` times, retrying ONLY while the result
+    is transient. Pure w.r.t. the injected `sleep`/`clock`, so it unit-tests with
+    no MetaTrader5 and no real wall-clock.
+
+      order_send():            callable -> broker result (or None on IPC error).
+      classify_transient(res): True if this result should be retried.
+      done_retcode:            retcode meaning success (TRADE_RETCODE_DONE).
+
+    Stops on: success, a non-transient result, attempts exhausted, or when one
+    more backoff would exceed `max_sec` (keeps retries well inside the LIMIT's
+    15-min window). Returns (last_result, tries, retries) where `retries` lists
+    {try, retcode} for each retried failure (for logging/alerts)."""
+    started = clock()
+    tries = 0
+    retries = []
+    while True:
+        tries += 1
+        res = order_send()
+        rc = None if res is None else getattr(res, "retcode", None)
+        if res is not None and rc == done_retcode:
+            return res, tries, retries
+        if (not classify_transient(res)) or tries >= attempts or \
+           (clock() - started + backoff > max_sec):
+            return res, tries, retries
+        retries.append({"try": tries, "retcode": rc})
+        sleep(backoff)
+
+
+def _f(v):
+    """ASCII-safe 2-decimal float for messages; passes non-numerics through."""
+    try:
+        return f"{float(v):.2f}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def format_reject_message(d):
+    """ASCII-only WhatsApp text for a REAL order definitively rejected by the
+    broker (transient retries already exhausted). Keys: kind, side, symbol,
+    strategy, entry, sl, tp, retcode, attempts, reason."""
+    return "\n".join([
+        f"ORDEN RECHAZADA ({d.get('kind', '?')})",
+        f"{d.get('side')} {d.get('symbol', 'GOLD-T')}  {d.get('strategy') or '?'}",
+        f"entry={_f(d.get('entry'))}  SL={_f(d.get('sl'))}  TP={_f(d.get('tp'))}",
+        f"retcode={d.get('retcode')} ({retcode_name(d.get('retcode'))})  intentos={d.get('attempts', '?')}",
+        f"motivo: {d.get('reason', '')}",
+    ])
+
+
+def format_expiry_message(d):
+    """ASCII-only WhatsApp text for a pending LIMIT that expired WITHOUT filling.
+    Keys: side, symbol, strategy, entry, sl, tp, ticket."""
+    return "\n".join([
+        "LIMIT EXPIRADA SIN LLENAR",
+        f"{d.get('side')} {d.get('symbol', 'GOLD-T')}  {d.get('strategy') or '?'}",
+        f"entry={_f(d.get('entry'))}  SL={_f(d.get('sl'))}  TP={_f(d.get('tp'))}",
+        f"ticket={d.get('ticket')}",
+        "la senal no se ejecuto en su ventana de 15min",
+    ])
+
+
+def format_watchdog_message(healthy, detail):
+    """ASCII-only WhatsApp text for a bridge health state change."""
+    head = "WATCHDOG: ejecucion RECUPERADA" if healthy else "WATCHDOG: ejecucion CAIDA"
+    return f"{head}\n{detail}"

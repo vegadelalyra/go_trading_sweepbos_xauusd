@@ -2,7 +2,9 @@
 import os
 import tempfile
 
-from bridgelib import signal_key, append_order, load_recent_keys, format_fill_message
+from bridgelib import (signal_key, append_order, load_recent_keys, format_fill_message,
+                       is_transient_retcode, retcode_name, send_with_retry,
+                       format_reject_message, format_expiry_message, format_watchdog_message)
 
 
 def test_signal_key():
@@ -53,6 +55,100 @@ def test_format_fill_message_no_tp():
     assert "TP=none" in msg
     assert "ganancia@TP" not in msg   # no TP -> no gain line
     assert "  ?" in msg               # missing strategy renders as '?'
+
+
+# ── resilience: retcode classifier + send_with_retry + alert formatters ──────
+
+class _Res:
+    def __init__(self, retcode):
+        self.retcode = retcode
+
+
+def _transient(r):
+    return True if r is None else is_transient_retcode(getattr(r, "retcode", None))
+
+
+def test_is_transient_retcode():
+    for rc in (10031, 10004, 10021):
+        assert is_transient_retcode(rc), rc
+    for rc in (10009, 0, 10015, 10016, 10018, 10019, 10027, None, "x"):
+        assert not is_transient_retcode(rc), rc
+
+
+def test_retcode_name():
+    assert retcode_name(10031) == "CONNECTION"
+    assert retcode_name(10009) == "DONE"
+    assert retcode_name(123456) == "123456"
+
+
+def test_send_with_retry_transient_then_success():
+    seq = [_Res(10031), _Res(10004), _Res(10009)]  # 2 transient, then DONE
+    i = {"n": 0}
+
+    def send():
+        r = seq[i["n"]]
+        i["n"] += 1
+        return r
+
+    res, tries, retries = send_with_retry(send, _transient, 10009, attempts=5,
+                                          backoff=0.0, max_sec=999,
+                                          sleep=lambda *_: None, clock=lambda: 0.0)
+    assert res.retcode == 10009
+    assert tries == 3, tries
+    assert len(retries) == 2
+
+
+def test_send_with_retry_terminal_no_retry():
+    res, tries, retries = send_with_retry(lambda: _Res(10019), _transient, 10009,
+                                          attempts=5, backoff=0.0,
+                                          sleep=lambda *_: None, clock=lambda: 0.0)
+    assert res.retcode == 10019
+    assert tries == 1, tries
+    assert retries == []
+
+
+def test_send_with_retry_exhausts_attempts():
+    res, tries, _ = send_with_retry(lambda: _Res(10031), _transient, 10009,
+                                    attempts=3, backoff=0.0,
+                                    sleep=lambda *_: None, clock=lambda: 0.0)
+    assert res.retcode == 10031
+    assert tries == 3, tries
+
+
+def test_send_with_retry_none_is_transient_and_time_bounded():
+    ticks = iter([0.0, 100.0, 200.0])
+    res, tries, _ = send_with_retry(lambda: None, _transient, 10009, attempts=10,
+                                    backoff=4.0, max_sec=20.0,
+                                    sleep=lambda *_: None, clock=lambda: next(ticks))
+    assert res is None
+    assert tries == 1, tries  # None is transient, but the time budget blew at once
+
+
+def test_format_reject_message():
+    msg = format_reject_message({
+        "kind": "REAL", "side": "BUY", "symbol": "GOLD-T", "strategy": "OrderBlockMit",
+        "entry": 4070.0, "sl": 4066.0, "tp": 4082.0, "retcode": 10031, "attempts": 3,
+        "reason": "order_send retcode=10031 (CONNECTION): no connection"})
+    assert msg.isascii()
+    for t in ("ORDEN RECHAZADA (REAL)", "BUY GOLD-T", "OrderBlockMit",
+              "retcode=10031 (CONNECTION)", "intentos=3"):
+        assert t in msg, (t, msg)
+
+
+def test_format_expiry_message():
+    msg = format_expiry_message({"side": "BUY", "symbol": "GOLD-T", "strategy": "SilverBullet",
+                                 "entry": 4070.0, "sl": 4066.0, "tp": 4082.0, "ticket": 555})
+    assert msg.isascii()
+    for t in ("LIMIT EXPIRADA SIN LLENAR", "BUY GOLD-T", "ticket=555", "15min"):
+        assert t in msg, (t, msg)
+
+
+def test_format_watchdog_message():
+    down = format_watchdog_message(False, "bridge unreachable")
+    up = format_watchdog_message(True, "OK equity=$380")
+    assert down.startswith("WATCHDOG: ejecucion CAIDA")
+    assert up.startswith("WATCHDOG: ejecucion RECUPERADA")
+    assert down.isascii() and up.isascii()
 
 
 if __name__ == "__main__":
