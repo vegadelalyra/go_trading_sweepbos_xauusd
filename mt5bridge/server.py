@@ -34,6 +34,7 @@ import os
 import threading
 import time
 import urllib.request
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from bridgelib import (signal_key, append_order, load_recent_keys,
@@ -62,6 +63,16 @@ HALT_FILE = os.environ.get("MT5_HALT_FILE", os.path.join(DL, "HALT"))
 WPP_ENDPOINT = os.environ.get("MT5_WPP_ENDPOINT", "http://127.0.0.1:8080/api/send")
 WPP_PHONE = os.environ.get("MT5_WPP_PHONE", "573137054945")
 WPP_NOTIFY = os.environ.get("MT5_WPP_NOTIFY", "1") == "1"
+
+# GOLD-T closed window, in the broker's SERVER time. Confirmed from 2 weeks of M1
+# history: the symbol shuts ~23:58 and reopens 01:00 server every day (the broker's
+# midnight metals rollover, = ~21:00-22:00 UTC) and stays shut all weekend. We read
+# the server clock from the latest tick (mt5 encodes server time), so this needs no
+# UTC offset and survives DST. During the weekend the tick freezes at Fri 23:58, so
+# the daily rule covers it too. Holidays (off this schedule) are still caught by the
+# live retcode-10018 backstop in do_POST. Window is env-tunable if the broker shifts.
+CLOSED_FROM_MIN = int(os.environ.get("MT5_CLOSED_FROM_MIN", str(23 * 60 + 58)))  # 23:58 srv
+CLOSED_TO_MIN = int(os.environ.get("MT5_CLOSED_TO_MIN", str(60)))               # 01:00 srv
 
 # Optional daily-loss circuit breaker: refuse NEW orders once equity has fallen
 # more than this fraction below the day's starting equity. 0 = disabled (default,
@@ -123,6 +134,23 @@ def send_whatsapp(text):
         log.info("wpp sent (%d chars)", len(text))
     except Exception as e:
         log.warning("wpp notify failed: %s", e)
+
+
+def market_closed_window(srv):
+    """True iff the broker server datetime falls in a GOLD-T closed window (daily
+    23:58->01:00 rollover or weekend -- the tick freezes at Fri 23:58 all weekend,
+    so the daily rule covers it). srv=None => fail OPEN (let the order try; the
+    broker's retcode 10018 is the backstop)."""
+    if srv is None:
+        return False
+    mins = srv.hour * 60 + srv.minute
+    return mins >= CLOSED_FROM_MIN or mins < CLOSED_TO_MIN
+
+
+def format_closed_message(side, strategy, entry, sl, tp, detail):
+    return ("Senal %s %s NO ejecutada -- GOLD-T cerrado (%s). "
+            "entry %s SL %s TP %s. Esperado fuera de horario del broker, "
+            "no es falla del sistema." % (side, strategy or "?", detail, entry, sl, tp))
 
 
 # ─────────────────────────────── MT5-backed ops ───────────────────────────────
@@ -367,7 +395,16 @@ class Handler(BaseHTTPRequestHandler):
             _acc = mt5.account_info()
             _eq = float(_acc.equity) if _acc else 0.0
             _refresh_daily_baseline(_eq)
-            if daily_loss_breached(_eq, day_start_equity, MAX_DAILY_LOSS_PCT):
+            # market-hours guard: don't fire a futile order into the broker's
+            # closed window (daily rollover / weekend). Read the SERVER clock from
+            # the latest tick. Only gates real (armed) orders; dry-run still checks.
+            _tick = mt5.symbol_info_tick(SYMBOL)
+            _srv = datetime.utcfromtimestamp(_tick.time) if (_tick and getattr(_tick, "time", 0)) else None
+            if ARM and market_closed_window(_srv):
+                r = {"ok": False, "dry_run": False, "sent": False, "closed_window": True,
+                     "side": side, "symbol": SYMBOL, "entry": entry, "sl": sl, "tp": tp,
+                     "reason": "GOLD-T cerrado (break diario ~21:00-22:00 UTC o fin de semana) -- no ejecutada"}
+            elif daily_loss_breached(_eq, day_start_equity, MAX_DAILY_LOSS_PCT):
                 r = {"ok": False, "daily_loss": True, "dry_run": not ARM,
                      "equity": _eq, "day_start_equity": day_start_equity,
                      "reason": (f"daily-loss limit: equity ${_eq:.2f} <= "
@@ -403,6 +440,13 @@ class Handler(BaseHTTPRequestHandler):
             if daily_loss_alerted_date != _today:
                 daily_loss_alerted_date = _today
                 send_whatsapp("CIRCUIT BREAKER diario -- ejecucion pausada. " + r["reason"])
+        elif r.get("closed_window"):
+            # Predicted broker-closed window: skipped the futile send, alert clearly
+            # (not an error -- the broker simply doesn't trade GOLD-T right now).
+            log_order({"event": "skip_closed", "key": key, "strategy": strategy,
+                       "side": side, "entry": entry, "sl": sl, "tp": tp, "reason": r["reason"]})
+            send_whatsapp(format_closed_message(side, strategy, entry, sl, tp,
+                                                "break diario ~21:00-22:00 UTC o fin de semana"))
         elif not r["dry_run"] and r.get("sent"):
             # A REAL order reached the broker and was definitively rejected
             # (transient retries already exhausted in place_order). Alert so the
@@ -412,7 +456,13 @@ class Handler(BaseHTTPRequestHandler):
                        "side": side, "entry": entry, "sl": sl, "tp": tp,
                        "retcode": r.get("retcode"), "attempts": r.get("attempts"),
                        "reason": r["reason"]})
-            send_whatsapp(format_reject_message(r))
+            # retcode 10018 = MARKET_CLOSED: a holiday/edge the predictive guard
+            # didn't cover. Phrase it as a closed-window notice, not a scary reject.
+            if r.get("retcode") == 10018:
+                send_whatsapp(format_closed_message(side, strategy, entry, sl, tp,
+                                                    "mercado cerrado, broker retcode 10018"))
+            else:
+                send_whatsapp(format_reject_message(r))
         log.info("ORDER key=%s side=%s -> ok=%s dry=%s reason=%s lots=%s ticket=%s",
                  key, side, r.get("ok"), r.get("dry_run"), r.get("reason"),
                  r.get("lots"), r.get("ticket"))
